@@ -23,13 +23,14 @@ source install/setup.bash
 
 #######################################
 # Terminator 1: Gazebo
+# ros2 launch turtlebot4_gz_bringup turtlebot4_gz.launch.py model:=lite rviz:=true SLAM:=true;
 #######################################
 terminator \
   --title="Gazebo Simulator" \
   -e "bash -c '
     source $WS/install/setup.bash;
     echo \"Launching Gazebo\";
-    ros2 launch turtlebot4_gz_bringup turtlebot4_gz.launch.py model:=lite rviz:=true SLAM:=true;
+    ros2 launch turtlebot4_gz_bringup turtlebot4_gz.launch.py model:=lite world:=maze rviz:=true slam:=true;
     exec bash
   '" &
 
