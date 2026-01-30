@@ -157,38 +157,43 @@ private:
             RCLCPP_INFO(this->get_logger(), "Position: (%.2f, %.2f), Orientation: %f rad or %f deg, Minimum laser distance: %.2f", pos_x_, pos_y_, yaw_, rad2deg(yaw_), minLaserDist_);
             if (val) {
                 any_bumper_pressed = true;
-                
-                break;
+                angular_ = M_PI / 2; // Turn left on bumper press
+                linear_ = 0.0;
+                RCLCPP_INFO(this->get_logger(), "Bumper pressed, turning left.");
             }
         }
         //Added: 0.7 minimum Laser distance to move forward
-        if (pos_x_ < 0.5 && yaw_ < M_PI /12 && minLaserDist_ > 0.7 && !any_bumper_pressed) {
+        /*
+        if (minLaserDist_ >= 1 && !any_bumper_pressed) {
             
             angular_ = 0.0;
-            linear_ = 0.2;
+            linear_ = 0.25;
         } 
-        // Turn condition: only turn if distance >= 0.5 m
-        else if (yaw_> M_PI/2 && pos_x_ > 0.5 && minLaserDist_ > 0.5 && !any_bumper_pressed){
+        */
+        // Turn condition: only turn if distance >= 0.3 m
+        if (minLaserDist_ < 1 && !any_bumper_pressed){
 
-            angular_ = M_PI /6; 
-            linear_ = 0.0; 
+            angular_ = M_PI /2; 
+            linear_ = 0.0;
         } 
+        // else if (front )
 
+        /*
         else if (minLaserDist_ < 1.0 && !any_bumper_pressed) { 
             linear_ = 0.1; 
-            if (yaw_ < 17/36 * M_PI|| pos_x_ > 0.6) {
+            if (yaw_ < 17/36 * M_PI) {
                 angular_ = M_PI / 12; // Turn left
             } 
-            else if (yaw_ < 19/36 * M_PI && pos_x_ < 0.4) {
+            else if (yaw_ < 19/36 * M_PI) {
                 angular_ = -M_PI / 12; // Turn right
             }
             else{
                 angular_ = 0.0; // Go straight
             }
         }
-        
+        */
         else {
-            angular_ = 0.0; // Stop turning
+            angular_ = 0.25; // Stop turning
             linear_ = 0.0; // Stop moving forward
             //rclcpp::shutdown();
             //return;
