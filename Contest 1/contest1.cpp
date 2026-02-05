@@ -21,7 +21,6 @@ inline double rad2deg(double rad){return rad * (180.0 / M_PI);}
 inline double deg2rad(double deg){return deg * (M_PI / 180.0);}
 
 
-
 class Contest1Node : public rclcpp::Node
 {
 public:
@@ -78,12 +77,18 @@ public:
 private:
     void laserCallback(const sensor_msgs::msg::LaserScan::SharedPtr scan)
     {
+    
+    RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+    "Laser FOV: angle_min=%.3f rad (%.1f deg), angle_max=%.3f rad (%.1f deg), inc=%.5f rad, N=%zu",
+    scan->angle_min, rad2deg(scan->angle_min),
+    scan->angle_max, rad2deg(scan->angle_max),
+    scan->angle_increment, scan->ranges.size());
       //(void) scan;  // implement your code here
       nLasers_ = (scan->angle_max - scan->angle_min) / scan->angle_increment;
       laserRange_= scan->ranges;
       desiredNLasers_= deg2rad(desiredAngle_)/(scan->angle_increment);
       //RCLCPP_INFO(this->get_logger(), "Size of laser scan array: %d, and size of offset %d", nLasers_, desiredNLasers_);
-
+        /*
       //Accounting for the LiDAR 90 degree offset
         float laser_offset = deg2rad(-90.0);
         uint32_t front_idx = (laser_offset - scan->angle_min) / scan->angle_increment;
@@ -104,6 +109,102 @@ private:
                 minLaserDist_ = std::min(minLaserDist_, laserRange_[laser_idx]);
             }
         }
+            */
+        laserRange_ = scan->ranges;
+        int N = (int)laserRange_.size();
+        if (N == 0) return;
+
+        // window size from your desiredAngle_ (± desiredAngle_)
+        int half_window = (int)(deg2rad(desiredAngle_) / scan->angle_increment);
+        if (half_window < 1) half_window = 1;
+
+        // We define "front" as angle 0 rad in the scan frame.
+        // We define "right" as -90 deg in the scan frame.
+        // (These are the *usual* conventions; if it’s flipped in your sim, we’ll swap signs.)
+        float front_ang = deg2rad(-90.0f);
+        float right_ang = deg2rad(-180.0f);  // or +180
+        float left_ang  = deg2rad(0.0f);
+        float back_ang  = deg2rad(90.0f);
+        // Convert angle -> index
+        int front_idx = (int)((front_ang - scan->angle_min) / scan->angle_increment);
+        int right_idx = (int)((right_ang - scan->angle_min) / scan->angle_increment);
+        int left_idx  = (int)((left_ang  - scan->angle_min) / scan->angle_increment);
+        int back_idx  = (int)((back_ang  - scan->angle_min) / scan->angle_increment);
+
+        // Clamp
+        if (front_idx < 0) front_idx = 0;
+        if (front_idx > N-1) front_idx = N-1;
+        if (right_idx < 0) right_idx = 0;
+        if (right_idx > N-1) right_idx = N-1;
+        if (left_idx < 0) left_idx = 0;
+        if (left_idx > N-1) left_idx = N-1;
+        if (back_idx < 0) back_idx = 0;
+        if (back_idx > N-1) back_idx = N-1;
+
+        // Compute min in each window
+        float frontDist = std::numeric_limits<float>::infinity();
+        float rightDist = std::numeric_limits<float>::infinity();
+        float leftDist  = std::numeric_limits<float>::infinity();
+        float backDist  = std::numeric_limits<float>::infinity();
+
+        int f0 = std::max(0, front_idx - half_window);
+        int f1 = std::min(N-1, front_idx + half_window);
+        int r0 = std::max(0, right_idx - half_window);
+        int r1 = std::min(N-1, right_idx + half_window);
+        int l0 = std::max(0, left_idx - half_window);
+        int l1 = std::min(N-1, left_idx + half_window);
+        int b0 = std::max(0, back_idx - half_window);
+        int b1 = std::min(N-1, back_idx + half_window);
+
+
+        for (int i = f0; i <= f1; i++) {
+            float d = laserRange_[i];
+            if (std::isfinite(d) && d > 0.01f) frontDist = std::min(frontDist, d);
+        }
+        for (int i = r0; i <= r1; i++) {
+            float d = laserRange_[i];
+            if (std::isfinite(d) && d > 0.01f) rightDist = std::min(rightDist, d);
+        }
+        for (int i = l0; i <= l1; i++) {
+            float d = laserRange_[i];
+            if (std::isfinite(d) && d > 0.01f) leftDist = std::min(leftDist, d);
+        }
+        for (int i = b0; i <= b1; i++) {
+            float d = laserRange_[i];
+            if (std::isfinite(d) && d > 0.01f) backDist = std::min(backDist, d);
+        }
+
+        // Store for control loop
+        frontDist_ = frontDist;
+        rightDist_ = rightDist;
+        leftDist_  = leftDist;
+        backDist_  = backDist;
+
+        // Keep your old variable working
+        minLaserDist_ = std::min(
+            std::min(frontDist_, rightDist_),
+            std::min(leftDist_, backDist_)
+        ); 
+
+        RCLCPP_INFO_THROTTLE(
+        this->get_logger(),
+        *this->get_clock(),
+        500,
+        "Front=%.2f  Left=%.2f  Right=%.2f  Back=%.2f  MIN=%.2f",
+        frontDist_, leftDist_, rightDist_, backDist, minLaserDist_);
+
+        /*
+        RCLCPP_INFO_THROTTLE(
+        this->get_logger(),
+        *this->get_clock(),
+        2000,   // ms
+        "FOV deg: [%.1f, %.1f], frontDist=%.2f rightDist=%.2f",
+        rad2deg(scan->angle_min),
+        rad2deg(scan->angle_max),
+
+        frontDist_,
+        rightDist_);
+        */
     }
 
     void odomCallback(const nav_msgs::msg::Odometry::SharedPtr odom)
@@ -129,12 +230,11 @@ private:
         for (const auto& detection : hazard_vector->detections) {
             if (detection.type == irobot_create_msgs::msg::HazardDetection::BUMP) {
                 bumpers_[detection.header.frame_id] = true;
-                RCLCPP_INFO(this->get_logger(), "Bumper pressed: %s",
-                            detection.header.frame_id.c_str());
+                //RCLCPP_INFO(this->get_logger(), "Bumper pressed: %s",
+                            //detection.header.frame_id.c_str());
             }
         }
     }
-
     void controlLoop()
     {
         // Calculate elapsed time
@@ -179,10 +279,10 @@ private:
         return;
     }
     
-    docked_ = false; // (you can implement dock detection if desired)
+    docked = false; // (you can implement dock detection if desired)
 
-    if (docked_ == true) {
-        state_ == State::STARTUP_BACKOFF;
+    if (docked == true) {
+        state_ = State::UNDOCKING;
     }
 
     else {
@@ -222,7 +322,7 @@ private:
 
         // Done: switch to exploration
         state_ = State::EXPLORATION;
-        RCLCPP_INFO(this->get_logger(), "STARTUP_BACKOFF done -> EXPLORE");
+        // RCLCPP_INFO(this->get_logger(), "STARTUP_BACKOFF done -> EXPLORE");
         // fall through into EXPLORE this tick (or you can return after publishing stop)
         
         //  ============================================================
@@ -241,8 +341,7 @@ private:
                 break;
             }
         }
-
-        RCLCPP_INFO(this->get_logger(),
+        RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(),10000,   // ms10000,
                 "Pose:(%.2f, %.2f) yaw=%.2f rad (%.1f deg)  minLaser=%.2f  bumper=%d",
                 pos_x_, pos_y_, yaw_, rad2deg(yaw_), minLaserDist_, any_bumper_pressed ? 1 : 0);
 
@@ -259,51 +358,13 @@ private:
         const float D_SOFT      = 0.70f; // m: start steering away before wall
         const float D_HARD      = 0.35f; // m: too close -> spin in place
         //Added: 0.7 minimum Laser distance to move forward
-        /*
-        if (minLaserDist_ >= 1 && !any_bumper_pressed) {
-            
-            angular_ = 0.0;
-            linear_ = 0.25;
-        } 
-        
-        // Turn condition: only turn if distance >= 0.3 m
-        if (minLaserDist_ < 0.2 && !any_bumper_pressed){
-
-            angular_ = M_PI*10; 
-            linear_ = -10;
-            
-        } 
-        
-
-        /*
-        else if (minLaserDist_ < 1.0 && !any_bumper_pressed) { 
-            linear_ = 0.1; 
-            if (yaw_ < 17/36 * M_PI) {
-                angular_ = M_PI / 12; // Turn left
-            } 
-            else if (yaw_ < 19/36 * M_PI) {
-                angular_ = -M_PI / 12; // Turn right
-            }
-            else{
-                angular_ = 0.0; // Go straight
-            }
-        }
-        
-        else {
-            
-            linear_ = 1;
-            //rclcpp::shutdown();
-            //return;
-        }
-        */
-        //
         // ============================================================
         // Reactive decision logic
         
         if (any_bumper_pressed) {
             // ---- Bumper pressed: back off + turn hard (escape) ----
             // Note: This is still "reactive" (no duration). If you want
-            //       "back off for 0.3s THEN turn 90deg", you need a state machine.
+            
             linear_  = V_BACKOFF;
             angular_ = W_BUMPER;
         }
@@ -358,11 +419,13 @@ private:
     State state_ = State::EXPLORATION;
 
     bool docked = true;
+    bool odom_ready_ = false;
 
     // Lidar Distances
     float frontDist_ = std::numeric_limits<float>::infinity();
     float leftDist_ = std::numeric_limits<float>::infinity();
     float rightDist_ = std::numeric_limits<float>::infinity();
+    float backDist_ = std::numeric_limits<float>::infinity();
 
     // undocking memory
     bool undock_init_ = false;
@@ -376,7 +439,10 @@ private:
     double last_x_ = 0.0;
     double last_y_ = 0.0;
     double traveled_ = 0.0;
-}
+    bool backoff_init_ = false;
+    double backoff_x0_ = 0.0;
+    double backoff_y0_ = 0.0;
+};
 
 int main(int argc, char** argv)
 {
