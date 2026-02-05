@@ -20,6 +20,8 @@ inline double rad2deg(double rad){return rad * (180.0 / M_PI);}
 
 inline double deg2rad(double deg){return deg * (M_PI / 180.0);}
 
+
+
 class Contest1Node : public rclcpp::Node
 {
 public:
@@ -65,6 +67,12 @@ public:
         desiredAngle_ = 5;
 
         RCLCPP_INFO(this->get_logger(), "Contest 1 node initialized. Running for 1000 seconds.");
+
+        state_ = docked ? State::UNDOCKING : State::EXPLORATION;
+
+        RCLCPP_INFO(this->get_logger(),
+                "Initial state: %s",
+                docked ? "UNDOCKING" : "EXPLORATION");
     }
 
 private:
@@ -89,7 +97,6 @@ private:
             for (uint32_t laser_idx = front_idx - desiredNLasers_; laser_idx <= front_idx + desiredNLasers_; ++laser_idx) {
                 minLaserDist_ = std::min(minLaserDist_, laserRange_[laser_idx]);
             }
-
         }
         else 
         {
@@ -109,7 +116,7 @@ private:
         yaw_ = tf2::getYaw(odom->pose.pose.orientation);
 
         //RCLCPP_INFO(this->get_logger(), "Position: (%.2f, %.2f), Orientation: %f rad or %f deg", pos_x_, pos_y_, yaw_, rad2deg(yaw_));
-    
+        odom_ready_ = true;
     }
 
     void hazardCallback(const irobot_create_msgs::msg::HazardDetectionVector::SharedPtr hazard_vector)
@@ -135,7 +142,7 @@ private:
         double seconds_elapsed = (current_time - start_time_).seconds();
 
         // Check if 480 seconds (8 minutes) have elapsed
-        if (seconds_elapsed >= 1000.0) {
+        if (seconds_elapsed >= 10000000000.0) {
             RCLCPP_INFO(this->get_logger(), "Contest time completed (1000 seconds). Stopping robot.");
 
             // Stop the robot
@@ -150,18 +157,107 @@ private:
             return;
         }
 
-        // Implement your exploration code here
         //
+        // ==================== Exploration Code =====================
+    linear_  = 0.0f;
+    angular_ = 0.0f;
+
+    // ------------------------------------------------------------
+    // 2) STARTUP STATE: back off 1.0 m from dock using odom
+    // ------------------------------------------------------------
+    
+    
+    // Don’t do anything until odom is valid (prevents backing off from (0,0))
+    if (!odom_ready_) {
+        RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+                                "Waiting for odom...");
+        geometry_msgs::msg::TwistStamped vel;
+        vel.header.stamp = this->now();
+        vel.twist.linear.x = 0.0;
+        vel.twist.angular.z = 0.0;
+        vel_pub_->publish(vel);
+        return;
+    }
+    
+    docked_ = false; // (you can implement dock detection if desired)
+
+    if (docked_ == true) {
+        state_ == State::STARTUP_BACKOFF;
+    }
+
+    else {
+        state_ = State::EXPLORATION;
+    }
+
+        // Latch starting pose ONCE
+        if (!backoff_init_) {
+            backoff_x0_ = pos_x_;
+            backoff_y0_ = pos_y_;
+            backoff_init_ = true;
+            RCLCPP_INFO(this->get_logger(), "STARTUP_BACKOFF: begin (target = 1.0 m)");
+        }
+
+        // Compute traveled distance from starting pose
+        double dx = pos_x_ - backoff_x0_;
+        double dy = pos_y_ - backoff_y0_;
+        double dist = std::sqrt(dx*dx + dy*dy);
+
+        const double BACKOFF_DIST = 1.0;  // meters
+        const float  V_START      = -0.20f; // m/s reverse (looks clear in sim)
+        const float  W_START      = M_PI/16;   // not keep straight (or 0.2f for gentle arc)
+
+        if (dist < BACKOFF_DIST) {
+            // Keep backing up until we reach 1.0 m
+            linear_  = V_START;
+            angular_ = W_START;
+
+            geometry_msgs::msg::TwistStamped vel;
+            vel.header.stamp = this->now();
+            vel.twist.linear.x = linear_;
+            vel.twist.angular.z = angular_;
+            vel_pub_->publish(vel);
+
+            return; // IMPORTANT: don’t run obstacle logic yet
+        }
+
+        // Done: switch to exploration
+        state_ = State::EXPLORATION;
+        RCLCPP_INFO(this->get_logger(), "STARTUP_BACKOFF done -> EXPLORE");
+        // fall through into EXPLORE this tick (or you can return after publishing stop)
+        
+        //  ============================================================
+        // Implement your exploration code here
+
+
+        // Bumper handling
         bool any_bumper_pressed = false; 
         for (const auto& [key, val] : bumpers_) {
-            RCLCPP_INFO(this->get_logger(), "Position: (%.2f, %.2f), Orientation: %f rad or %f deg, Minimum laser distance: %.2f", pos_x_, pos_y_, yaw_, rad2deg(yaw_), minLaserDist_);
+            //RCLCPP_INFO(this->get_logger(), "Position: (%.2f, %.2f), Orientation: %f rad or %f deg, Minimum laser distance: %.2f", pos_x_, pos_y_, yaw_, rad2deg(yaw_), minLaserDist_);
             if (val) {
                 any_bumper_pressed = true;
-                angular_ = M_PI / 2; // Turn left on bumper press
-                linear_ = 0.0;
-                RCLCPP_INFO(this->get_logger(), "Bumper pressed, turning left.");
+                //angular_ = M_PI *10; // Turn left on bumper press
+                //linear_ = -1000;
+                //RCLCPP_INFO(this->get_logger(), "Bumper pressed, turning left.");
+                break;
             }
         }
+
+        RCLCPP_INFO(this->get_logger(),
+                "Pose:(%.2f, %.2f) yaw=%.2f rad (%.1f deg)  minLaser=%.2f  bumper=%d",
+                pos_x_, pos_y_, yaw_, rad2deg(yaw_), minLaserDist_, any_bumper_pressed ? 1 : 0);
+
+
+        const float V_FAST      = 0.30f; // m/s: cruise speed in open space
+        const float V_CREEP     = 0.08f; // m/s: slow forward while turning near wall
+        const float V_BACKOFF   = -0.15f;// m/s: reverse on bumper
+
+        const float W_TURN      = 1.40f; // rad/s: quick turning while creeping
+        const float W_SPIN      = 1.80f; // rad/s: fast spin-in-place when very close
+        const float W_BUMPER    = 1.60f; // rad/s: strong turn when bumper hit
+
+        // Distance thresholds (react early)
+        const float D_SOFT      = 0.70f; // m: start steering away before wall
+        const float D_HARD      = 0.35f; // m: too close -> spin in place
         //Added: 0.7 minimum Laser distance to move forward
         /*
         if (minLaserDist_ >= 1 && !any_bumper_pressed) {
@@ -169,14 +265,15 @@ private:
             angular_ = 0.0;
             linear_ = 0.25;
         } 
-        */
+        
         // Turn condition: only turn if distance >= 0.3 m
-        if (minLaserDist_ < 1 && !any_bumper_pressed){
+        if (minLaserDist_ < 0.2 && !any_bumper_pressed){
 
-            angular_ = M_PI /2; 
-            linear_ = 0.0;
+            angular_ = M_PI*10; 
+            linear_ = -10;
+            
         } 
-        // else if (front )
+        
 
         /*
         else if (minLaserDist_ < 1.0 && !any_bumper_pressed) { 
@@ -191,14 +288,42 @@ private:
                 angular_ = 0.0; // Go straight
             }
         }
-        */
+        
         else {
-            angular_ = 0.25; // Stop turning
-            linear_ = 0.0; // Stop moving forward
+            
+            linear_ = 1;
             //rclcpp::shutdown();
             //return;
         }
+        */
         //
+        // ============================================================
+        // Reactive decision logic
+        
+        if (any_bumper_pressed) {
+            // ---- Bumper pressed: back off + turn hard (escape) ----
+            // Note: This is still "reactive" (no duration). If you want
+            //       "back off for 0.3s THEN turn 90deg", you need a state machine.
+            linear_  = V_BACKOFF;
+            angular_ = W_BUMPER;
+        }
+        else if (minLaserDist_ < D_HARD) {
+            // ---- Very close to obstacle: rotate quickly in place ----
+            linear_  = 0.0f;
+            angular_ = W_SPIN;
+        }
+        else if (minLaserDist_ < D_SOFT) {
+            // ---- Approaching obstacle: creep forward while turning away ----
+            linear_  = V_CREEP;
+            angular_ = W_TURN;
+        }
+        else {
+            // ---- Clear: drive fast and straight ----
+            linear_  = V_FAST;
+            angular_ = 0.0f;
+        }
+
+
         // Set velocity command
         geometry_msgs::msg::TwistStamped vel;
         vel.header.stamp = this->now();
@@ -227,7 +352,31 @@ private:
     int32_t desiredNLasers_;
     int32_t desiredAngle_;
     std::vector<float> laserRange_;
-};
+
+    // --- State machine for startup ---
+    enum class State { UNDOCKING, EXPLORATION, WALL_FOLLOW, BUMPED };
+    State state_ = State::EXPLORATION;
+
+    bool docked = true;
+
+    // Lidar Distances
+    float frontDist_ = std::numeric_limits<float>::infinity();
+    float leftDist_ = std::numeric_limits<float>::infinity();
+    float rightDist_ = std::numeric_limits<float>::infinity();
+
+    // undocking memory
+    bool undock_init_ = false;
+    double undock_x0_ = 0.0;
+    double undock_y0_ = 0.0;
+
+    //Bumped memory
+    bool bumped_init_ = false;
+    double loop_x0_ = 0.0;
+    double loop_y0_ = 0.0;
+    double last_x_ = 0.0;
+    double last_y_ = 0.0;
+    double traveled_ = 0.0;
+}
 
 int main(int argc, char** argv)
 {
