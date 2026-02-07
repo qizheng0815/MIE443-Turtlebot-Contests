@@ -5,6 +5,8 @@
 #include <vector>
 #include <algorithm>
 #include <string>
+#include <limits>
+#include <random>
 
 #include "rclcpp/rclcpp.hpp"
 #include "geometry_msgs/msg/twist_stamped.hpp"
@@ -16,10 +18,34 @@
 
 using namespace std::chrono_literals;
 
-inline double rad2deg(double rad){return rad * (180.0 / M_PI);}
+inline double rad2deg(double rad) { return rad * (180.0 / M_PI); }
+inline double deg2rad(double deg) { return deg * (M_PI / 180.0); }
 
-inline double deg2rad(double deg){return deg * (M_PI / 180.0);}
+inline double normalize_angle(double angle)
+{
+    while (angle > M_PI) angle -= 2.0 * M_PI;
+    while (angle < -M_PI) angle += 2.0 * M_PI;
+    return angle;
+}
 
+enum class State {
+    UNDOCKING,
+    EXPLORATION,
+    WALL_FOLLOW,
+    BUMPED
+};
+
+enum class WallFollowSubState {
+    ALIGNING,
+    FOLLOWING
+};
+
+enum class BumpSubState {
+    CHECK_SENSORS,
+    BACKING,
+    TURNING,
+    FORWARD_ARC
+};
 
 class Contest1Node : public rclcpp::Node
 {
@@ -27,7 +53,6 @@ public:
     Contest1Node()
         : Node("contest1_node")
     {
-        // Initialize publisher for velocity commands
         vel_pub_ = this->create_publisher<geometry_msgs::msg::TwistStamped>("/cmd_vel", 10);
 
         laser_sub_ = this->create_subscription<sensor_msgs::msg::LaserScan>(
@@ -42,356 +67,667 @@ public:
             "/odom", rclcpp::SensorDataQoS(),
             std::bind(&Contest1Node::odomCallback, this, std::placeholders::_1));
 
-        // Timer for main control loop at 10 Hz
         timer_ = this->create_wall_timer(
             100ms, std::bind(&Contest1Node::controlLoop, this));
 
-        // Initialize variables
         start_time_ = this->now();
-        angular_ = 0.0;
-        linear_ = 0.0;
+        current_state_ = State::UNDOCKING;
+        undock_phase_ = 0;
+        
+        pos_x_ = 0.0; pos_y_ = 0.0; yaw_ = 0.0;
+        
+        // Initial sensor values
+        minLaserDistFront_ = std::numeric_limits<float>::infinity();
+        minLaserDistRight_ = std::numeric_limits<float>::infinity();
+        minLaserDistLeft_  = std::numeric_limits<float>::infinity();
+        laser_left_front_ = std::numeric_limits<float>::infinity();
+        laser_left_back_ = std::numeric_limits<float>::infinity();
+        laser_right_front_ = std::numeric_limits<float>::infinity();
+        laser_right_back_ = std::numeric_limits<float>::infinity();
+        
+        minDistIndexRight_ = -1;
+        minDistIndexLeft_ = -1;
+        angle_increment__ = 0.0;
 
-        bumpers_["bump_front_left"]   = false;
-        bumpers_["bump_front_center"] = false;
-        bumpers_["bump_front_right"]  = false;
-        bumpers_["bump_left"]         = false;
-        bumpers_["bump_right"]        = false;
-
-        pos_x_ = 0.0;
-        pos_y_ = 0.0;
-        yaw_ = 0.0;
-        minLaserDist_ = std::numeric_limits<float>::infinity();
-        nLasers_ = 0;
-        desiredNLasers_ = 0;
-        desiredAngle_ = 5;
-
-        RCLCPP_INFO(this->get_logger(), "Contest 1 node initialized. Running for 1000 seconds.");
-
-        state_ = docked ? State::UNDOCKING : State::EXPLORATION;
-
-        RCLCPP_INFO(this->get_logger(),
-                "Initial state: %s",
-                docked ? "UNDOCKING" : "EXPLORATION");
+        RCLCPP_INFO(this->get_logger(), "Contest 1 node initialized. State: UNDOCKING.");
     }
 
 private:
     void laserCallback(const sensor_msgs::msg::LaserScan::SharedPtr scan)
     {
-    
-    RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
-    "Laser FOV: angle_min=%.3f rad (%.1f deg), angle_max=%.3f rad (%.1f deg), inc=%.5f rad, N=%zu",
-    scan->angle_min, rad2deg(scan->angle_min),
-    scan->angle_max, rad2deg(scan->angle_max),
-    scan->angle_increment, scan->ranges.size());
-      //(void) scan;  // implement your code here
-      nLasers_ = (scan->angle_max - scan->angle_min) / scan->angle_increment;
-      laserRange_= scan->ranges;
-      desiredNLasers_= deg2rad(desiredAngle_)/(scan->angle_increment);
-      //RCLCPP_INFO(this->get_logger(), "Size of laser scan array: %d, and size of offset %d", nLasers_, desiredNLasers_);
-        /*
-      //Accounting for the LiDAR 90 degree offset
-        float laser_offset = deg2rad(-90.0);
-        uint32_t front_idx = (laser_offset - scan->angle_min) / scan->angle_increment;
+        float angle_increment_ = scan->angle_increment;
+        float angle_min_ = scan->angle_min;
 
-        minLaserDist_ = std::numeric_limits<float>::infinity();
+        int num_readings = (int)scan->ranges.size();   // FIX: real length
 
-        // Find minimum distance in front center
+        // reset mins
+        minLaserDistFront_ = std::numeric_limits<float>::infinity();
+        minLaserDistRight_ = std::numeric_limits<float>::infinity();
+        minLaserDistLeft_  = std::numeric_limits<float>::infinity();
+        // Reset the new rays
+        laser_left_front_ = std::numeric_limits<float>::infinity();
+        laser_left_back_ = std::numeric_limits<float>::infinity();
+        laser_right_front_ = std::numeric_limits<float>::infinity();
+        laser_right_back_ = std::numeric_limits<float>::infinity();
 
-        if (deg2rad(desiredAngle_) < scan-> angle_max && deg2rad(desiredAngle_) > scan-> angle_min)
-        {
-            for (uint32_t laser_idx = front_idx - desiredNLasers_; laser_idx <= front_idx + desiredNLasers_; ++laser_idx) {
-                minLaserDist_ = std::min(minLaserDist_, laserRange_[laser_idx]);
+        minDistIndexFront_ = -1;
+        minDistIndexRight_ = -1;
+        minDistIndexLeft_  = -1;
+
+        // ============================================
+        // FRONT WINDOW: -95° to -85° (centered at -90°)
+        // ============================================
+        int front_start = (int)((deg2rad(-95.0) - angle_min_) / angle_increment_);
+        int front_end   = (int)((deg2rad(-85.0) - angle_min_) / angle_increment_);
+        
+        if (front_start < 0) front_start = 0;
+        if (front_end >= num_readings) front_end = num_readings - 1;
+        if (front_start > front_end) std::swap(front_start, front_end);
+
+        for (int i = front_start; i <= front_end; ++i) {
+            float r = scan->ranges[i];
+            if (std::isfinite(r) && r > 0.05f && r < minLaserDistFront_) {
+                minLaserDistFront_ = r;
+                minDistIndexFront_ = i;
             }
         }
-        else 
-        {
-            for(uint32_t laser_idx = 0; laser_idx < nLasers_; ++laser_idx) {
-                minLaserDist_ = std::min(minLaserDist_, laserRange_[laser_idx]);
+
+        // ============================================
+        // RIGHT WINDOW: 175° to -175° (centered at ±180°)
+        // ============================================
+        int right_start = (int)((deg2rad(175.0) - angle_min_) / angle_increment_);
+        int right_end   = (int)((deg2rad(-175.0) - angle_min_) / angle_increment_);
+        
+        if (right_start < 0) right_start = 0;
+        if (right_end >= num_readings) right_end = num_readings - 1;
+        if (right_start > right_end) std::swap(right_start, right_end);
+        
+        for (int i = right_start; i <= right_end; ++i) {
+            float r = scan->ranges[i];
+            if (std::isfinite(r) && r > 0.05f && r < minLaserDistRight_) {
+                minLaserDistRight_ = r;
+                minDistIndexRight_ = i;
             }
         }
-            */
-        laserRange_ = scan->ranges;
-        int N = (int)laserRange_.size();
-        if (N == 0) return;
 
-        // window size from your desiredAngle_ (± desiredAngle_)
-        int half_window = (int)(deg2rad(desiredAngle_) / scan->angle_increment);
-        if (half_window < 1) half_window = 1;
+        // ============================================
+        // LEFT WINDOW: -10° to +10° (centered at 0°)
+        // ============================================
+        int left_start = (int)((deg2rad(-10.0) - angle_min_) / angle_increment_);
+        int left_end   = (int)((deg2rad(10.0) - angle_min_) / angle_increment_);
+        
+        if (left_start < 0) left_start = 0;
+        if (left_end >= num_readings) left_end = num_readings - 1;
+        if (left_start > left_end) std::swap(left_start, left_end);
 
-        // We define "front" as angle 0 rad in the scan frame.
-        // We define "right" as -90 deg in the scan frame.
-        // (These are the *usual* conventions; if it’s flipped in your sim, we’ll swap signs.)
-        float front_ang = deg2rad(-90.0f);
-        float right_ang = deg2rad(-180.0f);  // or +180
-        float left_ang  = deg2rad(0.0f);
-        float back_ang  = deg2rad(90.0f);
-        // Convert angle -> index
-        int front_idx = (int)((front_ang - scan->angle_min) / scan->angle_increment);
-        int right_idx = (int)((right_ang - scan->angle_min) / scan->angle_increment);
-        int left_idx  = (int)((left_ang  - scan->angle_min) / scan->angle_increment);
-        int back_idx  = (int)((back_ang  - scan->angle_min) / scan->angle_increment);
-
-        // Clamp
-        if (front_idx < 0) front_idx = 0;
-        if (front_idx > N-1) front_idx = N-1;
-        if (right_idx < 0) right_idx = 0;
-        if (right_idx > N-1) right_idx = N-1;
-        if (left_idx < 0) left_idx = 0;
-        if (left_idx > N-1) left_idx = N-1;
-        if (back_idx < 0) back_idx = 0;
-        if (back_idx > N-1) back_idx = N-1;
-
-        // Compute min in each window
-        float frontDist = std::numeric_limits<float>::infinity();
-        float rightDist = std::numeric_limits<float>::infinity();
-        float leftDist  = std::numeric_limits<float>::infinity();
-        float backDist  = std::numeric_limits<float>::infinity();
-
-        int f0 = std::max(0, front_idx - half_window);
-        int f1 = std::min(N-1, front_idx + half_window);
-        int r0 = std::max(0, right_idx - half_window);
-        int r1 = std::min(N-1, right_idx + half_window);
-        int l0 = std::max(0, left_idx - half_window);
-        int l1 = std::min(N-1, left_idx + half_window);
-        int b0 = std::max(0, back_idx - half_window);
-        int b1 = std::min(N-1, back_idx + half_window);
-
-
-        for (int i = f0; i <= f1; i++) {
-            float d = laserRange_[i];
-            if (std::isfinite(d) && d > 0.01f) frontDist = std::min(frontDist, d);
-        }
-        for (int i = r0; i <= r1; i++) {
-            float d = laserRange_[i];
-            if (std::isfinite(d) && d > 0.01f) rightDist = std::min(rightDist, d);
-        }
-        for (int i = l0; i <= l1; i++) {
-            float d = laserRange_[i];
-            if (std::isfinite(d) && d > 0.01f) leftDist = std::min(leftDist, d);
-        }
-        for (int i = b0; i <= b1; i++) {
-            float d = laserRange_[i];
-            if (std::isfinite(d) && d > 0.01f) backDist = std::min(backDist, d);
+        for (int i = left_start; i <= left_end; ++i) {
+            float r = scan->ranges[i];
+            if (std::isfinite(r) && r > 0.05f && r < minLaserDistLeft_) {
+                minLaserDistLeft_ = r;
+                minDistIndexLeft_ = i;
+            }
         }
 
-        // Store for control loop
-        frontDist_ = frontDist;
-        rightDist_ = rightDist;
-        leftDist_  = leftDist;
-        backDist_  = backDist;
+        // ============================================
+        // NEW: LEFT FRONT RAY (-30° to -40°)
+        // ============================================
+        int lf_start = (int)((deg2rad(-40.0) - angle_min_) / angle_increment_);
+        int lf_end   = (int)((deg2rad(-30.0) - angle_min_) / angle_increment_);
+        
+        if (lf_start < 0) lf_start = 0;
+        if (lf_end >= num_readings) lf_end = num_readings - 1;
+        if (lf_start > lf_end) std::swap(lf_start, lf_end);
+        
+        for (int i = lf_start; i <= lf_end; ++i) {
+            float r = scan->ranges[i];
+            if (std::isfinite(r) && r > 0.05f && r < laser_left_front_) {
+                laser_left_front_ = r;
+            }
+        }
 
-        // Keep your old variable working
-        minLaserDist_ = std::min(
-            std::min(frontDist_, rightDist_),
-            std::min(leftDist_, backDist_)
-        ); 
+        // ============================================
+        // NEW: LEFT BACK RAY (+30° to +40°)
+        // ============================================
+        int lb_start = (int)((deg2rad(30.0) - angle_min_) / angle_increment_);
+        int lb_end   = (int)((deg2rad(40.0) - angle_min_) / angle_increment_);
+        
+        if (lb_start < 0) lb_start = 0;
+        if (lb_end >= num_readings) lb_end = num_readings - 1;
+        if (lb_start > lb_end) std::swap(lb_start, lb_end);
+        
+        for (int i = lb_start; i <= lb_end; ++i) {
+            float r = scan->ranges[i];
+            if (std::isfinite(r) && r > 0.05f && r < laser_left_back_) {
+                laser_left_back_ = r;
+            }
+        }
 
+        // ============================================
+        // NEW: RIGHT FRONT RAY (-140° to -150°)
+        // ============================================
+        int rf_start = (int)((deg2rad(-150.0) - angle_min_) / angle_increment_);
+        int rf_end   = (int)((deg2rad(-140.0) - angle_min_) / angle_increment_);
+        
+        if (rf_start < 0) rf_start = 0;
+        if (rf_end >= num_readings) rf_end = num_readings - 1;
+        if (rf_start > rf_end) std::swap(rf_start, rf_end);
+        
+        for (int i = rf_start; i <= rf_end; ++i) {
+            float r = scan->ranges[i];
+            if (std::isfinite(r) && r > 0.05f && r < laser_right_front_) {
+                laser_right_front_ = r;
+            }
+        }
+
+        // ============================================
+        // NEW: RIGHT BACK RAY (+140° to +150°)
+        // ============================================
+        int rb_start = (int)((deg2rad(140.0) - angle_min_) / angle_increment_);
+        int rb_end   = (int)((deg2rad(150.0) - angle_min_) / angle_increment_);
+        
+        if (rb_start < 0) rb_start = 0;
+        if (rb_end >= num_readings) rb_end = num_readings - 1;
+        if (rb_start > rb_end) std::swap(rb_start, rb_end);
+        
+        for (int i = rb_start; i <= rb_end; ++i) {
+            float r = scan->ranges[i];
+            if (std::isfinite(r) && r > 0.05f && r < laser_right_back_) {
+                laser_right_back_ = r;
+            }
+        }
+
+        // Debug logging
         RCLCPP_INFO_THROTTLE(
-        this->get_logger(),
-        *this->get_clock(),
-        500,
-        "Front=%.2f  Left=%.2f  Right=%.2f  Back=%.2f  MIN=%.2f",
-        frontDist_, leftDist_, rightDist_, backDist, minLaserDist_);
-
-        /*
-        RCLCPP_INFO_THROTTLE(
-        this->get_logger(),
-        *this->get_clock(),
-        2000,   // ms
-        "FOV deg: [%.1f, %.1f], frontDist=%.2f rightDist=%.2f",
-        rad2deg(scan->angle_min),
-        rad2deg(scan->angle_max),
-
-        frontDist_,
-        rightDist_);
-        */
+            this->get_logger(), *this->get_clock(), 500,
+            "F=%.2f L=%.2f R=%.2f | LF=%.2f LB=%.2f RF=%.2f RB=%.2f",
+            minLaserDistFront_, minLaserDistLeft_, minLaserDistRight_,
+            laser_left_front_, laser_left_back_, laser_right_front_, laser_right_back_
+        );
     }
 
     void odomCallback(const nav_msgs::msg::Odometry::SharedPtr odom)
     {
-        // implement your code here
         pos_x_ = odom->pose.pose.position.x;
         pos_y_ = odom->pose.pose.position.y;
-
-        //Extract yaw from quaternion using tf2
         yaw_ = tf2::getYaw(odom->pose.pose.orientation);
-
-        //RCLCPP_INFO(this->get_logger(), "Position: (%.2f, %.2f), Orientation: %f rad or %f deg", pos_x_, pos_y_, yaw_, rad2deg(yaw_));
-        odom_ready_ = true;
     }
 
     void hazardCallback(const irobot_create_msgs::msg::HazardDetectionVector::SharedPtr hazard_vector)
     {
-        // implement your code here
-        for (auto& [key, val] : bumpers_) {
-            val = false; // reset all bumpers to false
-        }
+        bool any_bump = false;
+        std::string bumped_frame;
 
         for (const auto& detection : hazard_vector->detections) {
             if (detection.type == irobot_create_msgs::msg::HazardDetection::BUMP) {
-                bumpers_[detection.header.frame_id] = true;
-                //RCLCPP_INFO(this->get_logger(), "Bumper pressed: %s",
-                            //detection.header.frame_id.c_str());
+                bumped_frame = detection.header.frame_id;
+                any_bump = true;
+            }
+        }
+
+        if (any_bump) {
+            // Update bump memory
+            last_bumped_frame_ = bumped_frame;
+            
+            // If strictly new bump or we were in a non-bump state
+            if (current_state_ != State::BUMPED) {
+                original_yaw_before_bump_sequence_ = yaw_;
+                enterBumpedState();
+            } else {
+                // If we hit something *while* resolving a bump, restart the resolution
+                bump_sub_state_ = BumpSubState::CHECK_SENSORS;
+                stopRobot();
             }
         }
     }
+
+    // --- State Transition Helpers ---
+    void enterExplorationState() {
+        RCLCPP_INFO(this->get_logger(), "State: EXPLORATION");
+        current_state_ = State::EXPLORATION;
+        stopRobot();
+    }
+
+    void enterWallFollowState() {
+        RCLCPP_INFO(this->get_logger(), "State: WALL_FOLLOW");
+        current_state_ = State::WALL_FOLLOW;
+        wf_sub_state_ = WallFollowSubState::FOLLOWING;
+        
+        wall_follow_start_x_ = pos_x_;
+        wall_follow_start_y_ = pos_y_;
+        wall_follow_start_time_ = this->now();
+        
+        // Decide which wall to follow (closest one)
+        if (minLaserDistLeft_ < minLaserDistRight_) {
+            following_side_ = 1; // Left
+            RCLCPP_INFO(this->get_logger(), "Target: Left Wall (Dist: %.2f)", minLaserDistLeft_);
+        } else {
+            following_side_ = -1; // Right
+            RCLCPP_INFO(this->get_logger(), "Target: Right Wall (Dist: %.2f)", minLaserDistRight_);
+        }
+        stopRobot();
+    }
+
+    void enterBumpedState() {
+        RCLCPP_INFO(this->get_logger(), "State: BUMPED");
+        current_state_ = State::BUMPED;
+        bump_sub_state_ = BumpSubState::CHECK_SENSORS;
+        stopRobot();
+    }
+
     void controlLoop()
     {
-        // Calculate elapsed time
-        auto current_time = this->now();
-        double seconds_elapsed = (current_time - start_time_).seconds();
-
-        // Check if 480 seconds (8 minutes) have elapsed
-        if (seconds_elapsed >= 10000000000.0) {
-            RCLCPP_INFO(this->get_logger(), "Contest time completed (1000 seconds). Stopping robot.");
-
-            // Stop the robot
-            geometry_msgs::msg::TwistStamped vel;
-            vel.header.stamp = this->now();
-            vel.twist.linear.x = 0.0;
-            vel.twist.angular.z = 0.0;
-            vel_pub_->publish(vel);
-
-            // Shutdown the node
+        if ((this->now() - start_time_).seconds() >= 1000.0) {
+            stopRobot();
             rclcpp::shutdown();
             return;
         }
 
-        //
-        // ==================== Exploration Code =====================
-    linear_  = 0.0f;
-    angular_ = 0.0f;
-
-    // ------------------------------------------------------------
-    // 2) STARTUP STATE: back off 1.0 m from dock using odom
-    // ------------------------------------------------------------
-    
-    
-    // Don’t do anything until odom is valid (prevents backing off from (0,0))
-    if (!odom_ready_) {
-        RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
-                                "Waiting for odom...");
         geometry_msgs::msg::TwistStamped vel;
         vel.header.stamp = this->now();
-        vel.twist.linear.x = 0.0;
-        vel.twist.angular.z = 0.0;
-        vel_pub_->publish(vel);
-        return;
-    }
+
+        switch (current_state_) {
+            // ================= STATE 1: UNDOCKING =================
+            case State::UNDOCKING:
+            {
+                static double start_x = pos_x_;
+                static double start_y = pos_y_;
+                static bool init = false;
+                if (!init) { start_x = pos_x_; start_y = pos_y_; init = true; }
+
+                if (undock_phase_ == 0) {
+                    double dist = std::hypot(pos_x_ - start_x, pos_y_ - start_y);
+                    if (dist < 0.3) {
+                        vel.twist.linear.x = -0.1; 
+                    } else {
+                        undock_phase_ = 1;
+                        undock_target_yaw_ = normalize_angle(yaw_ + M_PI);
+                        stopRobot();
+                    }
+                } else {
+                    double err = normalize_angle(undock_target_yaw_ - yaw_);
+                    if (std::abs(err) > 0.1) vel.twist.angular.z = (err > 0) ? 0.5 : -0.5;
+                    else enterExplorationState();
+                }
+                break;
+            }
+
+            // ================= STATE 2: EXPLORATION =================
+            case State::EXPLORATION:
+            {
+                if (minLaserDistFront_ < 0.5) {
+                    if (minLaserDistLeft_ < minLaserDistRight_) {
+                        RCLCPP_INFO(this->get_logger(), "Obstacle ahead! Turning RIGHT");
+                        vel.twist.angular.z = -deg2rad(90.0); // Turn in place
+                    } else {
+                        RCLCPP_INFO(this->get_logger(), "Obstacle ahead! Turning LEFT");
+                        vel.twist.angular.z = deg2rad(90.0); // Turn in place
+                    }
+
+                    enterWallFollowState();
+
+                } else {
+                    vel.twist.linear.x = 0.25;
+                    
+                }
+                vel_pub_->publish(vel);
+                break;
+            }
+
+            
+            // ================= STATE 3: WALL FOLLOW =================
+            case State::WALL_FOLLOW:
+            {
+                // =====================================================
+                // STEP 1: Determine which wall we're following
+                // =====================================================
+                float wall_center;      // Direct perpendicular distance
+                float wall_front;       // Front diagonal ray
+                float wall_back;        // Back diagonal ray
+                
+                if (following_side_ == 1) {
+                    // Following LEFT wall
+                    wall_center = minLaserDistLeft_;
+                    wall_front = laser_left_front_;
+                    wall_back = laser_left_back_;
+                } else {
+                    // Following RIGHT wall
+                    wall_center = minLaserDistRight_;
+                    wall_front = laser_right_front_;
+                    wall_back = laser_right_back_;
+                }
+
+                // =====================================================
+                // STEP 2: Check if wall is still visible
+                // =====================================================
+                bool wall_exists = std::isfinite(wall_center) && wall_center < 1.5;
+                
+                if (!wall_exists) {
+                    RCLCPP_WARN(this->get_logger(), "Wall lost! Returning to EXPLORATION");
+                    enterExplorationState();
+                    break;
+                }
+
+                // =====================================================
+                // STEP 3: ALIGNING - Get parallel to wall
+                // =====================================================
+                /*
+                if (wf_sub_state_ == WallFollowSubState::ALIGNING) {
+                    
+                    // Check if we have valid front and back readings
+                    bool can_align = std::isfinite(wall_front) && std::isfinite(wall_back);
+                    
+                    if (!can_align) {
+                        // Can't determine parallelism, skip to FOLLOWING
+                        RCLCPP_WARN(this->get_logger(), "Cannot determine parallelism, starting FOLLOWING");
+                        wf_sub_state_ = WallFollowSubState::FOLLOWING;
+                        break;
+                    }
+                    
+                    // Calculate parallelism error
+                    // If front < back: we're angled INTO wall (need to turn away)
+                    // If front > back: we're angled AWAY from wall (need to turn toward)
+                    float parallelism_error = wall_front - wall_back;
+                    
+                    RCLCPP_INFO_THROTTLE(
+                        this->get_logger(), *this->get_clock(), 500,
+                        "ALIGNING %s: Front=%.2fm, Back=%.2fm, Error=%.3fm",
+                        (following_side_ == 1) ? "LEFT" : "RIGHT",
+                        wall_front, wall_back, parallelism_error
+                    );
+                    
+                    // Threshold: within 5cm difference = good enough
+                    if (std::abs(parallelism_error) > 0.05) {
+                        // Still need to align
+                        vel.twist.linear.x = 0.0;  // Don't move forward while aligning
+                        
+                        // Control logic:
+                        // For LEFT wall (side=1):
+                        //   - If front closer (error < 0): turn RIGHT (negative z)
+                        //   - If back closer (error > 0): turn LEFT (positive z)
+                        // For RIGHT wall (side=-1):
+                        //   - If front closer (error < 0): turn LEFT (positive z)
+                        //   - If back closer (error > 0): turn RIGHT (negative z)
+                        
+                        vel.twist.angular.z = -following_side_ * 3.0 * parallelism_error;
+                        vel.twist.angular.z = std::clamp(vel.twist.angular.z, -0.5, 0.5);
+                        
+                    } else {
+                        // Aligned!
+                        RCLCPP_INFO(this->get_logger(), 
+                            "✓ ALIGNED! Parallel to %s wall at %.2fm. Starting FOLLOWING.",
+                            (following_side_ == 1) ? "LEFT" : "RIGHT",
+                            wall_center
+                        );
+                        wf_sub_state_ = WallFollowSubState::FOLLOWING;
+                        stopRobot();
+                    }
+                }
+                */
+                // =====================================================
+                // STEP 4: FOLLOWING - Maintain distance while moving
+                // =====================================================
+                if (wf_sub_state_ == WallFollowSubState::FOLLOWING) 
+                {
+                    // Target distance from wall
+                    const float DESIRED_DISTANCE = 0.40;  // 40cm from wall
+                    
+                    // ===== SUB-STEP 4A: Check front obstacle =====
+                    if (minLaserDistFront_ < 0.35) {
+                        // Obstacle ahead! Need to turn
+                        RCLCPP_INFO(this->get_logger(), "Front obstacle! Turning away from wall");
+                        
+                        vel.twist.linear.x = 0.05;  // Slow forward movement
+                        vel.twist.angular.z = following_side_ * 0.6;  // Turn away from wall
+                        // (LEFT wall: turn right, RIGHT wall: turn left)
+                    }
+                    
+                    // ===== SUB-STEP 4B: Detect corners =====
+                    else if (std::isfinite(wall_back) && std::isinf(wall_front)) {
+                        // OUTSIDE CORNER: Wall disappeared in front!
+                        RCLCPP_INFO(this->get_logger(), "OUTSIDE CORNER detected! Turning toward wall");
+                        
+                        vel.twist.linear.x = 0.10;
+                        vel.twist.angular.z = -following_side_ * 0.5;  // Turn toward wall
+                        // (LEFT wall: turn left, RIGHT wall: turn right)
+                    }
+                    else if (std::isfinite(wall_front) && wall_front < 0.25 && wall_center > 0.35) {
+                        // INSIDE CORNER: Wall suddenly very close in front!
+                        RCLCPP_INFO(this->get_logger(), "INSIDE CORNER detected! Turning away from wall");
+                        
+                        vel.twist.linear.x = 0.10;
+                        vel.twist.angular.z = following_side_ * 0.6;  // Turn away from wall
+                    }
+                    
+                    // ===== SUB-STEP 4C: Normal wall following =====
+                    else {
+                        // Calculate control errors
+                        float distance_error = DESIRED_DISTANCE - wall_center;
+                        float parallelism_error = 0.0;
+                        
+                        // If we have front/back rays, use them for parallelism control
+                        if (std::isfinite(wall_front) && std::isfinite(wall_back)) {
+                            parallelism_error = wall_front - wall_back;
+                        }
+                        
+                        // Move forward
+                        vel.twist.linear.x = 0.15;
+                        
+                        // Combined P-controller:
+                        // 1. Distance control: Keep DESIRED_DISTANCE from wall
+                        // 2. Parallelism control: Stay parallel to wall
+                        
+                        float Kp_distance = 1.5;      // Gain for distance error
+                        float Kp_parallel = 2.0;      // Gain for parallelism error
+                        
+                        // Distance control:
+                        // - If too far (error > 0): turn toward wall
+                        // - If too close (error < 0): turn away from wall
+                        float angular_from_distance = -following_side_ * Kp_distance * distance_error;
+                        
+                        // Parallelism control:
+                        // - If front closer (error < 0): turn away from wall
+                        // - If back closer (error > 0): turn toward wall
+                        float angular_from_parallel = -following_side_ * Kp_parallel * parallelism_error;
+                        
+                        // Combine both controllers
+                        vel.twist.angular.z = angular_from_distance + angular_from_parallel;
+                        vel.twist.angular.z = std::clamp(vel.twist.angular.z, -0.6, 0.6);
+                        
+                        RCLCPP_INFO_THROTTLE(
+                            this->get_logger(), *this->get_clock(), 1000,
+                            "Following: Dist=%.2fm(err=%.2f), Parallel=%.3fm, ω=%.2f",
+                            wall_center, distance_error, parallelism_error, vel.twist.angular.z
+                        );
+                    }
+                    
+                    // ===== SUB-STEP 4D: Loop closure check =====
+                    double elapsed_time = (this->now() - wall_follow_start_time_).seconds();
+                    
+                    if (elapsed_time > 10.0) {  // After 10 seconds minimum
+                        double dist_to_start = std::hypot(
+                            pos_x_ - wall_follow_start_x_, 
+                            pos_y_ - wall_follow_start_y_
+                        );
+                        
+                        if (dist_to_start < 0.4) {
+                            RCLCPP_INFO(this->get_logger(), 
+                                "Loop closure detected! Completed circuit in %.1f seconds", 
+                                elapsed_time
+                            );
+                            
+                            // Return to exploration (or stop, or turn, etc.)
+                            enterExplorationState();
+                        }
+                    }
+                }
+                
+                break;
+            }
+            /*
+            case State::WALL_FOLLOW:
+            {
+                // Determine active distance and index
+                float active_dist = (following_side_ == 1) ? minLaserDistLeft_ : minLaserDistRight_;
+                int active_index  = (following_side_ == 1) ? minDistIndexLeft_ : minDistIndexRight_;
+
+                if (wf_sub_state_ == WallFollowSubState::ALIGNING) {
+                    // "Rotate such that the minimum distance is further minimized"
+                    // Interpretation: Align robot so that the sensor reading the min distance is perpendicular (90 or -90).
+                    
+                    if (active_index == -1 || std::isinf(active_dist)) {
+                        // Lost wall? Just switch to following to try and recover or drift
+                        RCLCPP_WARN(this->get_logger(), "No wall detected, switching to FOLLOWING");
+                        wf_sub_state_ = WallFollowSubState::FOLLOWING;
+                        break;
+                    }
+
+                    // Calculate the angle of the minimum reading in the robot frame
+                    double angle_of_min_scan = angle_min__ + active_index * angle_increment__;
+                    
+                    // Target: For left wall (0°), for right wall (-180° or π)
+                    double target_angle;
+                    if (following_side_ == 1) {
+                        // Following LEFT wall - want minimum at 0° (directly left)
+                        target_angle = 0.0;
+                    } else {
+                        // Following RIGHT wall - want minimum at ±π (directly right)
+                        target_angle = M_PI;
+                    }
+
+                    double alignment_error = normalize_angle(target_angle - angle_of_min_scan);
     
-    docked = false; // (you can implement dock detection if desired)
+                    RCLCPP_INFO_THROTTLE(
+                        this->get_logger(), *this->get_clock(), 500,
+                        "Aligning: min_angle=%.1f°, target=%.1f°, error=%.1f°",
+                        rad2deg(angle_of_min_scan),
+                        rad2deg(target_angle),
+                        rad2deg(alignment_error)
+                    );
+    
 
-    if (docked == true) {
-        state_ = State::UNDOCKING;
-    }
+                    if (std::abs(alignment_error) > deg2rad(5.0)) {
+                        vel.twist.linear.x = 0.0;  // Don't move forward while aligning
+                        vel.twist.angular.z = std::clamp(1.0 * alignment_error, -0.5, 0.5);
+                    } else {
+                        RCLCPP_INFO(this->get_logger(), "Aligned to wall. Distance: %.2fm", active_dist);
+                        wf_sub_state_ = WallFollowSubState::FOLLOWING;
+                        stopRobot(); 
+                    }
+                } 
+                else if (wf_sub_state_ == WallFollowSubState::FOLLOWING) 
+                {
+                    // Move forward and monitor target distance (0.5m)
+                    double desired_dist = 0.5;
+                    double error = desired_dist - active_dist;
+                    if (std::isinf(active_dist)) error = 0.0;
 
-    else {
-        state_ = State::EXPLORATION;
-    }
+                    vel.twist.linear.x = 0.15;
+                    
+                    // P-Controller
+                    // If Left Wall (side=1): Too close (err>0) -> Turn Right (-z).
+                    // If Right Wall (side=-1): Too close (err>0) -> Turn Left (+z).
+                    // Formula: angular = -1 * side * Kp * error
+                    
+                    vel.twist.angular.z = -1.0 * following_side_ * 1.5 * error;
+                    vel.twist.angular.z = std::clamp(vel.twist.angular.z, -0.5, 0.5);
 
-        // Latch starting pose ONCE
-        if (!backoff_init_) {
-            backoff_x0_ = pos_x_;
-            backoff_y0_ = pos_y_;
-            backoff_init_ = true;
-            RCLCPP_INFO(this->get_logger(), "STARTUP_BACKOFF: begin (target = 1.0 m)");
-        }
+                    // Loop Closure Check (after 5s)
+                    if ((this->now() - wall_follow_start_time_).seconds() > 5.0) {
+                        double d_start = std::hypot(pos_x_ - wall_follow_start_x_, pos_y_ - wall_follow_start_y_);
+                        if (d_start < 0.3) {
+                            RCLCPP_INFO(this->get_logger(), "Loop Closed. Resetting.");
+                            // For simplicity, just enter exploration. (User asked for 160 deg turn previously, 
+                            // assuming similar logic applies or just reset)
+                            undock_phase_ = 1; // Hijack undock rotation logic
+                            undock_target_yaw_ = normalize_angle(yaw_ + deg2rad(160.0));
+                            current_state_ = State::UNDOCKING; // Go to rotation phase of undock
+                        }
+                    }
+                }
+                break;
+            }
+            */
 
-        // Compute traveled distance from starting pose
-        double dx = pos_x_ - backoff_x0_;
-        double dy = pos_y_ - backoff_y0_;
-        double dist = std::sqrt(dx*dx + dy*dy);
+            // ================= STATE 4: BUMPED =================
+            case State::BUMPED:
+            {
+                switch (bump_sub_state_) {
+                    case BumpSubState::CHECK_SENSORS:
+                    {
+                        if (minLaserDistFront_ < 0.1) {
+                            enterWallFollowState();
+                        } else {
+                            // Prepare backing up
+                            bump_start_x_ = pos_x_;
+                            bump_start_y_ = pos_y_;
+                            bump_sub_state_ = BumpSubState::BACKING;
+                        }
+                        break;
+                    }
 
-        const double BACKOFF_DIST = 1.0;  // meters
-        const float  V_START      = -0.20f; // m/s reverse (looks clear in sim)
-        const float  W_START      = M_PI/16;   // not keep straight (or 0.2f for gentle arc)
+                    case BumpSubState::BACKING:
+                    {
+                        double dist = std::hypot(pos_x_ - bump_start_x_, pos_y_ - bump_start_y_);
+                        if (dist < 0.1) {
+                            vel.twist.linear.x = -0.1; // Reverse
+                        } else {
+                            // Done backing up, calculate turn
+                            stopRobot();
+                            double turn_rad = deg2rad(90.0);
 
-        if (dist < BACKOFF_DIST) {
-            // Keep backing up until we reach 1.0 m
-            linear_  = V_START;
-            angular_ = W_START;
+                            if (last_bumped_frame_.find("right") != std::string::npos) {
+                                // Right Bumped -> Turn Left (+90)
+                                bump_target_yaw_ = normalize_angle(yaw_ + turn_rad);
+                                bump_turn_direction_ = 1.0; 
+                            } else {
+                                // Left/Center Bumped -> Turn Right (-90)
+                                bump_target_yaw_ = normalize_angle(yaw_ - turn_rad);
+                                bump_turn_direction_ = -1.0;
+                            }
+                            bump_sub_state_ = BumpSubState::TURNING;
+                        }
+                        break;
+                    }
 
-            geometry_msgs::msg::TwistStamped vel;
-            vel.header.stamp = this->now();
-            vel.twist.linear.x = linear_;
-            vel.twist.angular.z = angular_;
-            vel_pub_->publish(vel);
+                    case BumpSubState::TURNING:
+                    {
+                        double err = normalize_angle(bump_target_yaw_ - yaw_);
+                        if (std::abs(err) > 0.1) {
+                            vel.twist.linear.x = 0.0;
+                            vel.twist.angular.z = (bump_turn_direction_ > 0) ? 0.5 : -0.5;
+                        } else {
+                            bump_sub_state_ = BumpSubState::FORWARD_ARC;
+                        }
+                        break;
+                    }
 
-            return; // IMPORTANT: don’t run obstacle logic yet
-        }
+                    case BumpSubState::FORWARD_ARC:
+                    {
+                        // "while moving forwards turn slight right" (if we turned left)
+                        // Inverse logic: Arc direction = -1 * turn_direction
+                        double yaw_diff = std::abs(normalize_angle(yaw_ - original_yaw_before_bump_sequence_));
 
-        // Done: switch to exploration
-        state_ = State::EXPLORATION;
-        // RCLCPP_INFO(this->get_logger(), "STARTUP_BACKOFF done -> EXPLORE");
-        // fall through into EXPLORE this tick (or you can return after publishing stop)
-        
-        //  ============================================================
-        // Implement your exploration code here
-
-
-        // Bumper handling
-        bool any_bumper_pressed = false; 
-        for (const auto& [key, val] : bumpers_) {
-            //RCLCPP_INFO(this->get_logger(), "Position: (%.2f, %.2f), Orientation: %f rad or %f deg, Minimum laser distance: %.2f", pos_x_, pos_y_, yaw_, rad2deg(yaw_), minLaserDist_);
-            if (val) {
-                any_bumper_pressed = true;
-                //angular_ = M_PI *10; // Turn left on bumper press
-                //linear_ = -1000;
-                //RCLCPP_INFO(this->get_logger(), "Bumper pressed, turning left.");
+                        if (yaw_diff < 0.1) {
+                            enterExplorationState();
+                        } else {
+                            vel.twist.linear.x = 0.15;
+                            // Apply slight turn in OPPOSITE direction of the 90 deg turn
+                            vel.twist.angular.z = -1.0 * bump_turn_direction_ * 0.3;
+                        }
+                        break;
+                    }
+                }
                 break;
             }
         }
-        RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(),10000,   // ms10000,
-                "Pose:(%.2f, %.2f) yaw=%.2f rad (%.1f deg)  minLaser=%.2f  bumper=%d",
-                pos_x_, pos_y_, yaw_, rad2deg(yaw_), minLaserDist_, any_bumper_pressed ? 1 : 0);
 
+        vel_pub_->publish(vel);
+    }
 
-        const float V_FAST      = 0.30f; // m/s: cruise speed in open space
-        const float V_CREEP     = 0.08f; // m/s: slow forward while turning near wall
-        const float V_BACKOFF   = -0.15f;// m/s: reverse on bumper
-
-        const float W_TURN      = 1.40f; // rad/s: quick turning while creeping
-        const float W_SPIN      = 1.80f; // rad/s: fast spin-in-place when very close
-        const float W_BUMPER    = 1.60f; // rad/s: strong turn when bumper hit
-
-        // Distance thresholds (react early)
-        const float D_SOFT      = 0.70f; // m: start steering away before wall
-        const float D_HARD      = 0.35f; // m: too close -> spin in place
-        //Added: 0.7 minimum Laser distance to move forward
-        // ============================================================
-        // Reactive decision logic
-        
-        if (any_bumper_pressed) {
-            // ---- Bumper pressed: back off + turn hard (escape) ----
-            // Note: This is still "reactive" (no duration). If you want
-            
-            linear_  = V_BACKOFF;
-            angular_ = W_BUMPER;
-        }
-        else if (minLaserDist_ < D_HARD) {
-            // ---- Very close to obstacle: rotate quickly in place ----
-            linear_  = 0.0f;
-            angular_ = W_SPIN;
-        }
-        else if (minLaserDist_ < D_SOFT) {
-            // ---- Approaching obstacle: creep forward while turning away ----
-            linear_  = V_CREEP;
-            angular_ = W_TURN;
-        }
-        else {
-            // ---- Clear: drive fast and straight ----
-            linear_  = V_FAST;
-            angular_ = 0.0f;
-        }
-
-
-        // Set velocity command
+    void stopRobot() {
         geometry_msgs::msg::TwistStamped vel;
         vel.header.stamp = this->now();
-        vel.twist.linear.x = linear_;
-        vel.twist.angular.z = angular_;
-
-        // Publish velocity command
+        vel.twist.linear.x = 0.0; vel.twist.angular.z = 0.0;
         vel_pub_->publish(vel);
     }
 
@@ -400,57 +736,47 @@ private:
     rclcpp::Subscription<irobot_create_msgs::msg::HazardDetectionVector>::SharedPtr hazard_sub_;
     rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_sub_;
     rclcpp::TimerBase::SharedPtr timer_;
+
     rclcpp::Time start_time_;
+    State current_state_;
+
+    double pos_x_, pos_y_, yaw_;
     
-    float angular_;
-    float linear_;
-    double pos_x_;
-    double pos_y_;
-    double yaw_;
-    std::map<std::string, bool> bumpers_;
-    float minLaserDist_;
-    int32_t nLasers_;
-    int32_t desiredNLasers_;
-    int32_t desiredAngle_;
-    std::vector<float> laserRange_;
+    // Sensor Data
+    std::string last_bumped_frame_;
+    float minLaserDistFront_;
+    float minLaserDistLeft_, minLaserDistRight_;
+    int minDistIndexFront_;
+    int minDistIndexLeft_, minDistIndexRight_;
+    float angle_increment__, angle_min__;
+    float laser_left_front_;
+    float laser_left_back_;
+    float laser_right_front_;
+    float laser_right_back_;
 
-    // --- State machine for startup ---
-    enum class State { UNDOCKING, EXPLORATION, WALL_FOLLOW, BUMPED };
-    State state_ = State::EXPLORATION;
+    // Undock
+    int undock_phase_;
+    double undock_target_yaw_;
 
-    bool docked = true;
-    bool odom_ready_ = false;
+    // Wall Follow
+    WallFollowSubState wf_sub_state_;
+    int following_side_; // 1 = Left, -1 = Right
+    double wall_follow_start_x_, wall_follow_start_y_;
+    rclcpp::Time wall_follow_start_time_;
 
-    // Lidar Distances
-    float frontDist_ = std::numeric_limits<float>::infinity();
-    float leftDist_ = std::numeric_limits<float>::infinity();
-    float rightDist_ = std::numeric_limits<float>::infinity();
-    float backDist_ = std::numeric_limits<float>::infinity();
-
-    // undocking memory
-    bool undock_init_ = false;
-    double undock_x0_ = 0.0;
-    double undock_y0_ = 0.0;
-
-    //Bumped memory
-    bool bumped_init_ = false;
-    double loop_x0_ = 0.0;
-    double loop_y0_ = 0.0;
-    double last_x_ = 0.0;
-    double last_y_ = 0.0;
-    double traveled_ = 0.0;
-    bool backoff_init_ = false;
-    double backoff_x0_ = 0.0;
-    double backoff_y0_ = 0.0;
+    // Bump
+    BumpSubState bump_sub_state_;
+    double bump_start_x_, bump_start_y_;
+    double original_yaw_before_bump_sequence_;
+    double bump_target_yaw_;
+    double bump_turn_direction_;
 };
 
 int main(int argc, char** argv)
 {
     rclcpp::init(argc, argv);
     auto node = std::make_shared<Contest1Node>();
-
     rclcpp::spin(node);
-
     rclcpp::shutdown();
     return 0;
 }
