@@ -84,45 +84,46 @@ public:
         laser_left_back_ = std::numeric_limits<float>::infinity();
         laser_right_front_ = std::numeric_limits<float>::infinity();
         laser_right_back_ = std::numeric_limits<float>::infinity();
+        laser_back_ =   std::numeric_limits<float>::infinity();
         
         minDistIndexRight_ = -1;
         minDistIndexLeft_ = -1;
         angle_increment__ = 0.0;
 
+
+
         RCLCPP_INFO(this->get_logger(), "Contest 1 node initialized. State: UNDOCKING.");
     }
 
-private:
     void laserCallback(const sensor_msgs::msg::LaserScan::SharedPtr scan)
     {
         float angle_increment_ = scan->angle_increment;
         float angle_min_ = scan->angle_min;
+        int num_readings = (int)scan->ranges.size();
 
-        int num_readings = (int)scan->ranges.size();   // FIX: real length
-
-        // reset mins
+        // Reset all minimum distances
         minLaserDistFront_ = std::numeric_limits<float>::infinity();
         minLaserDistRight_ = std::numeric_limits<float>::infinity();
         minLaserDistLeft_  = std::numeric_limits<float>::infinity();
-        // Reset the new rays
-        laser_left_front_ = std::numeric_limits<float>::infinity();
-        laser_left_back_ = std::numeric_limits<float>::infinity();
+        laser_left_front_  = std::numeric_limits<float>::infinity();
+        laser_left_back_   = std::numeric_limits<float>::infinity();
         laser_right_front_ = std::numeric_limits<float>::infinity();
-        laser_right_back_ = std::numeric_limits<float>::infinity();
+        laser_right_back_  = std::numeric_limits<float>::infinity();
+        laser_back_        = std::numeric_limits<float>::infinity();
 
         minDistIndexFront_ = -1;
         minDistIndexRight_ = -1;
         minDistIndexLeft_  = -1;
 
         // ============================================
-        // FRONT WINDOW: -95° to -85° (centered at -90°)
+        // FRONT WINDOW: -94° to -86° (centered at -90°)
         // ============================================
-        int front_start = (int)((deg2rad(-95.0) - angle_min_) / angle_increment_);
-        int front_end   = (int)((deg2rad(-85.0) - angle_min_) / angle_increment_);
+        int front_start = (int)((deg2rad(-94.0) - angle_min_) / angle_increment_);
+        int front_end   = (int)((deg2rad(-86.0) - angle_min_) / angle_increment_);
         
         if (front_start < 0) front_start = 0;
         if (front_end >= num_readings) front_end = num_readings - 1;
-        if (front_start > front_end) std::swap(front_start, front_end);
+        //if (front_start > front_end) std::swap(front_start, front_end);
 
         for (int i = front_start; i <= front_end; ++i) {
             float r = scan->ranges[i];
@@ -133,34 +134,31 @@ private:
         }
 
         // ============================================
-        // RIGHT WINDOW: 175° to -175° (centered at ±180°)
+        // LEFT WINDOW: -4° to +4° (centered at 0°)
         // ============================================
-        int right_start = (int)((deg2rad(175.0) - angle_min_) / angle_increment_);
-        int right_end   = (int)((deg2rad(-175.0) - angle_min_) / angle_increment_);
+        int left_start_1 = (int)((deg2rad(-4.0) - angle_min_) / angle_increment_);
+        int left_end_1   = (int)((deg2rad(0) - angle_min_) / angle_increment_);
         
-        if (right_start < 0) right_start = 0;
-        if (right_end >= num_readings) right_end = num_readings - 1;
-        if (right_start > right_end) std::swap(right_start, right_end);
-        
-        for (int i = right_start; i <= right_end; ++i) {
+        if (left_start_1 < 0) left_start_1 = 0;
+        if (left_end_1 >= num_readings) left_end_1 = num_readings - 1;
+        //if (left_start_1 > left_end_1) std::swap(left_start, left_end);
+
+        for (int i = left_start_1; i <= left_end_1; ++i) {
             float r = scan->ranges[i];
-            if (std::isfinite(r) && r > 0.05f && r < minLaserDistRight_) {
-                minLaserDistRight_ = r;
-                minDistIndexRight_ = i;
+            if (std::isfinite(r) && r > 0.05f && r < minLaserDistLeft_) {
+                minLaserDistLeft_ = r;
+                minDistIndexLeft_ = i;
             }
         }
 
-        // ============================================
-        // LEFT WINDOW: -10° to +10° (centered at 0°)
-        // ============================================
-        int left_start = (int)((deg2rad(-10.0) - angle_min_) / angle_increment_);
-        int left_end   = (int)((deg2rad(10.0) - angle_min_) / angle_increment_);
+        int left_start_2 = (int)((deg2rad(0) - angle_min_) / angle_increment_);
+        int left_end_2  = (int)((deg2rad(4.0) - angle_min_) / angle_increment_);
         
-        if (left_start < 0) left_start = 0;
-        if (left_end >= num_readings) left_end = num_readings - 1;
-        if (left_start > left_end) std::swap(left_start, left_end);
+        if (left_start_2 < 0) left_start_2 = 0;
+        if (left_end_2 >= num_readings) left_end_2 = num_readings - 1;
+        //if (left_start > left_end) std::swap(left_start, left_end);
 
-        for (int i = left_start; i <= left_end; ++i) {
+        for (int i = left_start_2; i <= left_end_2; ++i) {
             float r = scan->ranges[i];
             if (std::isfinite(r) && r > 0.05f && r < minLaserDistLeft_) {
                 minLaserDistLeft_ = r;
@@ -169,14 +167,51 @@ private:
         }
 
         // ============================================
-        // NEW: LEFT FRONT RAY (-30° to -40°)
+        // RIGHT WINDOW: 175° to -175° (centered at ±180°)
+        // SPECIAL: Split into two windows to handle wrapping
         // ============================================
-        int lf_start = (int)((deg2rad(-40.0) - angle_min_) / angle_increment_);
-        int lf_end   = (int)((deg2rad(-30.0) - angle_min_) / angle_increment_);
+        
+        // RIGHT Part 1: 175° to 180°
+        int right_start_1 = (int)((deg2rad(175.0) - angle_min_) / angle_increment_);
+        int right_end_1   = (int)((deg2rad(180) - angle_min_) / angle_increment_);
+        
+        if (right_start_1 < 0) right_start_1 = 0;
+        if (right_end_1 >= num_readings) right_end_1 = num_readings - 1;
+        //if (right_start_1 > right_end_1) std::swap(right_start_1, right_end_1);
+        
+        for (int i = right_start_1; i <= right_end_1; ++i) {
+            float r = scan->ranges[i];
+            if (std::isfinite(r) && r > 0.05f && r < minLaserDistRight_) {
+                minLaserDistRight_ = r;
+                minDistIndexRight_ = i;
+            }
+        }
+
+        // RIGHT Part 2: -180° to -175°
+        int right_start_2 = (int)((deg2rad(-180) - angle_min_) / angle_increment_);
+        int right_end_2   = (int)((deg2rad(-175.0) - angle_min_) / angle_increment_);
+        
+        if (right_start_2 < 0) right_start_2 = 0;
+        if (right_end_2 >= num_readings) right_end_2 = num_readings - 1;
+        //if (right_start_2 > right_end_2) std::swap(right_start_2, right_end_2);
+        
+        for (int i = right_start_2; i <= right_end_2; ++i) {
+            float r = scan->ranges[i];
+            if (std::isfinite(r) && r > 0.05f && r < minLaserDistRight_) {
+                minLaserDistRight_ = r;
+                minDistIndexRight_ = i;
+            }
+        }
+
+        // ============================================
+        // LEFT FRONT RAY: -50° to -40°
+        // ============================================
+        int lf_start = (int)((deg2rad(-50.0) - angle_min_) / angle_increment_);
+        int lf_end   = (int)((deg2rad(-40.0) - angle_min_) / angle_increment_);
         
         if (lf_start < 0) lf_start = 0;
         if (lf_end >= num_readings) lf_end = num_readings - 1;
-        if (lf_start > lf_end) std::swap(lf_start, lf_end);
+        //if (lf_start > lf_end) std::swap(lf_start, lf_end);
         
         for (int i = lf_start; i <= lf_end; ++i) {
             float r = scan->ranges[i];
@@ -186,14 +221,14 @@ private:
         }
 
         // ============================================
-        // NEW: LEFT BACK RAY (+30° to +40°)
+        // LEFT BACK RAY: +40° to +50°
         // ============================================
-        int lb_start = (int)((deg2rad(30.0) - angle_min_) / angle_increment_);
-        int lb_end   = (int)((deg2rad(40.0) - angle_min_) / angle_increment_);
+        int lb_start = (int)((deg2rad(40.0) - angle_min_) / angle_increment_);
+        int lb_end   = (int)((deg2rad(50.0) - angle_min_) / angle_increment_);
         
         if (lb_start < 0) lb_start = 0;
         if (lb_end >= num_readings) lb_end = num_readings - 1;
-        if (lb_start > lb_end) std::swap(lb_start, lb_end);
+        //if (lb_start > lb_end) std::swap(lb_start, lb_end);
         
         for (int i = lb_start; i <= lb_end; ++i) {
             float r = scan->ranges[i];
@@ -203,14 +238,14 @@ private:
         }
 
         // ============================================
-        // NEW: RIGHT FRONT RAY (-140° to -150°)
+        // RIGHT FRONT RAY: -140° to -130°
         // ============================================
-        int rf_start = (int)((deg2rad(-150.0) - angle_min_) / angle_increment_);
-        int rf_end   = (int)((deg2rad(-140.0) - angle_min_) / angle_increment_);
+        int rf_start = (int)((deg2rad(-140.0) - angle_min_) / angle_increment_);
+        int rf_end   = (int)((deg2rad(-130.0) - angle_min_) / angle_increment_);
         
         if (rf_start < 0) rf_start = 0;
         if (rf_end >= num_readings) rf_end = num_readings - 1;
-        if (rf_start > rf_end) std::swap(rf_start, rf_end);
+        //if (rf_start > rf_end) std::swap(rf_start, rf_end);
         
         for (int i = rf_start; i <= rf_end; ++i) {
             float r = scan->ranges[i];
@@ -220,14 +255,14 @@ private:
         }
 
         // ============================================
-        // NEW: RIGHT BACK RAY (+140° to +150°)
+        // RIGHT BACK RAY: +130° to +140°
         // ============================================
-        int rb_start = (int)((deg2rad(140.0) - angle_min_) / angle_increment_);
-        int rb_end   = (int)((deg2rad(150.0) - angle_min_) / angle_increment_);
+        int rb_start = (int)((deg2rad(130.0) - angle_min_) / angle_increment_);
+        int rb_end   = (int)((deg2rad(140.0) - angle_min_) / angle_increment_);
         
         if (rb_start < 0) rb_start = 0;
         if (rb_end >= num_readings) rb_end = num_readings - 1;
-        if (rb_start > rb_end) std::swap(rb_start, rb_end);
+        //if (rb_start > rb_end) std::swap(rb_start, rb_end);
         
         for (int i = rb_start; i <= rb_end; ++i) {
             float r = scan->ranges[i];
@@ -236,11 +271,30 @@ private:
             }
         }
 
+        // ============================================
+        // BACK RAY: +86° to +94° (centered at +90°)
+        // ============================================
+        int back_start = (int)((deg2rad(86.0) - angle_min_) / angle_increment_);
+        int back_end   = (int)((deg2rad(94.0) - angle_min_) / angle_increment_);
+        
+        if (back_start < 0) back_start = 0;
+        if (back_end >= num_readings) back_end = num_readings - 1;
+        //if (back_start > back_end) std::swap(back_start, back_end);
+       
+        for (int i = back_start; i <= back_end; ++i) {
+            float r = scan->ranges[i];
+            if (std::isfinite(r) && r > 0.05f && r < laser_back_) {
+                laser_back_ = r;
+            }
+        }
+
+        // ============================================
         // Debug logging
+        // ============================================
         RCLCPP_INFO_THROTTLE(
             this->get_logger(), *this->get_clock(), 500,
-            "F=%.2f L=%.2f R=%.2f | LF=%.2f LB=%.2f RF=%.2f RB=%.2f",
-            minLaserDistFront_, minLaserDistLeft_, minLaserDistRight_,
+            "F=%.2f L=%.2f R=%.2f B=%.2f | LF=%.2f LB=%.2f RF=%.2f RB=%.2f",
+            minLaserDistFront_, minLaserDistLeft_, minLaserDistRight_, laser_back_,
             laser_left_front_, laser_left_back_, laser_right_front_, laser_right_back_
         );
     }
@@ -669,11 +723,11 @@ private:
                     {
                         double dist = std::hypot(pos_x_ - bump_start_x_, pos_y_ - bump_start_y_);
                         if (dist < 0.1) {
-                            vel.twist.linear.x = -0.1; // Reverse
+                            vel.twist.linear.x = -0.05; // Reverse
                         } else {
                             // Done backing up, calculate turn
                             stopRobot();
-                            double turn_rad = deg2rad(90.0);
+                            double turn_rad = deg2rad(60.0);
 
                             if (last_bumped_frame_.find("right") != std::string::npos) {
                                 // Right Bumped -> Turn Left (+90)
@@ -710,9 +764,9 @@ private:
                         if (yaw_diff < 0.1) {
                             enterExplorationState();
                         } else {
-                            vel.twist.linear.x = 0.15;
+                            vel.twist.linear.x = 0.05;
                             // Apply slight turn in OPPOSITE direction of the 90 deg turn
-                            vel.twist.angular.z = -1.0 * bump_turn_direction_ * 0.3;
+                            vel.twist.angular.z = -1.0 * bump_turn_direction_ * 0.5;
                         }
                         break;
                     }
@@ -753,7 +807,7 @@ private:
     float laser_left_back_;
     float laser_right_front_;
     float laser_right_back_;
-
+    float laser_back_;
     // Undock
     int undock_phase_;
     double undock_target_yaw_;
