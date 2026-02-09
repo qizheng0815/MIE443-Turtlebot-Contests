@@ -126,6 +126,9 @@ public:
         minDistIndexFront_ = -1;
         minDistIndexRight_ = -1;
         minDistIndexLeft_  = -1;
+        minDistIndexLeft_true_ = -1;
+        minDistIndexRight_true_ = -1;
+        
 
         // ============================================
         // FRONT WINDOW: -94° to -86° (centered at -90°)
@@ -181,7 +184,7 @@ public:
         // LEFT WINDOW Wide: -45° to +45° (centered at 0°)
         // ============================================
 
-        int left_start_3 = (int)((deg2rad(-45.0) - angle_min_) / angle_increment_);
+        int left_start_3 = (int)((deg2rad(-90) - angle_min_) / angle_increment_);
         int left_end_3   = (int)((deg2rad(0) - angle_min_) / angle_increment_);
         
         if (left_start_3 < 0) left_start_3 = 0;
@@ -190,14 +193,14 @@ public:
 
         for (int i = left_start_3; i <= left_end_3; ++i) {
             float r = scan->ranges[i];
-            if (std::isfinite(r) && r > 0.05f && r < minLaserDistLeft_) {
+            if (std::isfinite(r) && r > 0.05f && r < minLaserDistLeft_true_) {
                 minLaserDistLeft_true_= r;
                 minDistIndexLeft_true_= i;
             }
         }
 
         int left_start_4 = (int)((deg2rad(0) - angle_min_) / angle_increment_);
-        int left_end_4  = (int)((deg2rad(45.0) - angle_min_) / angle_increment_);
+        int left_end_4  = (int)((deg2rad(90) - angle_min_) / angle_increment_);
         
         if (left_start_4 < 0) left_start_4 = 0;
         if (left_end_4 >= num_readings) left_end_4 = num_readings - 1;
@@ -205,9 +208,9 @@ public:
 
         for (int i = left_start_4; i <= left_end_4; ++i) {
             float r = scan->ranges[i];
-            if (std::isfinite(r) && r > 0.05f && r < minLaserDistLeft_) {
+            if (std::isfinite(r) && r > 0.05f && r < minLaserDistLeft_true_) {
                 minLaserDistLeft_true_= r;
-                minLaserDistLeft_true_ = i;
+                minDistIndexLeft_true_ = i;
             }
         }
 
@@ -252,8 +255,8 @@ public:
         // Right WINDOW Wide: -135° to +135° (centered at 0°)
         // ============================================
 
-        int right_start_3 = (int)((deg2rad(-180.0) - angle_min_) / angle_increment_);
-        int right_end_3   = (int)((deg2rad(-135.0) - angle_min_) / angle_increment_);
+        int right_start_3 = (int)((deg2rad(-180) - angle_min_) / angle_increment_);
+        int right_end_3   = (int)((deg2rad(-90) - angle_min_) / angle_increment_);
         
         if (right_start_3 < 0) right_start_3 = 0;
         if (right_end_3 >= num_readings) right_end_3 = num_readings - 1;
@@ -261,13 +264,13 @@ public:
 
         for (int i = right_start_3; i <= right_end_3; ++i) {
             float r = scan->ranges[i];
-            if (std::isfinite(r) && r > 0.05f && r < minLaserDistRight_) {
+            if (std::isfinite(r) && r > 0.05f && r < minLaserDistRight_true_) {
                 minLaserDistRight_true_= r;
                 minDistIndexRight_true_= i;
             }
         }
 
-        int right_start_4 = (int)((deg2rad(135) - angle_min_) / angle_increment_);
+        int right_start_4 = (int)((deg2rad(90) - angle_min_) / angle_increment_);
         int right_end_4  = (int)((deg2rad(180) - angle_min_) / angle_increment_);
         
         if (right_start_4 < 0) right_start_4 = 0;
@@ -276,9 +279,9 @@ public:
 
         for (int i = right_start_4; i <= right_end_4; ++i) {
             float r = scan->ranges[i];
-            if (std::isfinite(r) && r > 0.05f && r < minLaserDistRight_) {
+            if (std::isfinite(r) && r > 0.05f && r < minLaserDistRight_true_) {
                 minLaserDistRight_true_ = r;
-                minLaserDistR ight_true_ = i;
+                minDistIndexRight_true_ = i;
             }
         }
 
@@ -370,12 +373,21 @@ public:
         // ============================================
         // Debug logging
         // ============================================
+
+        RCLCPP_INFO_THROTTLE(
+            this->get_logger(), *this->get_clock(), 500,
+            "L=%.2f R=%.2f",
+            minLaserDistLeft_true_, minLaserDistRight_true_
+        );
+
+        /*
         RCLCPP_INFO_THROTTLE(
             this->get_logger(), *this->get_clock(), 500,
             "F=%.2f L=%.2f R=%.2f B=%.2f | LF=%.2f LB=%.2f RF=%.2f RB=%.2f",
             minLaserDistFront_, minLaserDistLeft_, minLaserDistRight_, laser_back_,
             laser_left_front_, laser_left_back_, laser_right_front_, laser_right_back_
         );
+        */
     }
 
     void odomCallback(const nav_msgs::msg::Odometry::SharedPtr odom)
@@ -497,21 +509,22 @@ public:
             case State::EXPLORATION:
             {
                 if (minLaserDistFront_ < 0.5) {
-                    if (minLaserDistLeft_ < minLaserDistRight_) {
-                        RCLCPP_INFO(this->get_logger(), "Obstacle ahead! Turning RIGHT");
-                        vel.twist.angular.z = -deg2rad(90.0); // Turn in place
+                    if (minLaserDistLeft_true_ < minLaserDistRight_true_) {
+                        RCLCPP_INFO(this->get_logger(), "Left Wall Selected");
+                        //vel.twist.angular.z = -deg2rad(90.0); // Turn in place
                     } else {
-                        RCLCPP_INFO(this->get_logger(), "Obstacle ahead! Turning LEFT");
-                        vel.twist.angular.z = deg2rad(90.0); // Turn in place
+                        RCLCPP_INFO(this->get_logger(), "Right Wall Selected");
+                        //vel.twist.angular.z = deg2rad(90.0); // Turn in place
                     }
 
                     enterWallFollowState();
 
                 } else {
                     vel.twist.linear.x = 0.25;
+                    vel_pub_->publish(vel);
                     
                 }
-                vel_pub_->publish(vel);
+                //vel_pub_->publish(vel);
                 break;
             }
             
@@ -521,33 +534,28 @@ public:
                 // =====================================================
                 // STEP 1: Determine which wall we're following
                 // =====================================================
-                float wall_center;      // Direct perpendicular distance
-                float wall_front;       // Front diagonal ray
-                float wall_back;        // Back diagonal ray
-                
+                //
+                float wall_center = locked_target_distance_;      // Direct perpendicular distance
+                /*
                 if (following_side_ == 1) {
                     // Following LEFT wall
-                    wall_center = minLaserDistLeft_;
-                    wall_front = laser_left_front_;
-                    wall_back = laser_left_back_;
+                    wall_center = locked_target_distance_;
+
                 } else {
                     // Following RIGHT wall
-                    wall_center = minLaserDistRight_;
-                    wall_front = laser_right_front_;
-                    wall_back = laser_right_back_;
+                    wall_center = right_true;
+                    
                 }
-
+                */
                 // =====================================================
                 // STEP 2: Check if wall is still visible
                 // =====================================================
-                bool wall_exists = std::isfinite(wall_center) && wall_center < 1.5;
-                
-                if (!wall_exists) {
-                    RCLCPP_WARN(this->get_logger(), "Wall lost! Returning to EXPLORATION");
+                if (wall_center > 1.0f) {
+                    RCLCPP_WARN(this->get_logger(), "Wall lost! (dist=%.2fm)", wall_center);
                     enterExplorationState();
                     break;
                 }
-
+                            
                 // =====================================================
                 // STEP 3: ALIGNING - Get parallel to wall
                 // =====================================================
@@ -570,7 +578,7 @@ public:
                     );
                     
                     // Check if aligned (within 2cm)
-                    if (std::abs(distance_error) < 0.002f) {
+                    if (std::abs(distance_error) < 0.01f) {
                         RCLCPP_INFO(this->get_logger(), 
                             "✓ ALIGNED! Perpendicular sensor matches target (%.3fm). Starting FOLLOWING.",
                             current_perpendicular
@@ -593,8 +601,9 @@ public:
                         //   - If perp > target (error > 0): turn RIGHT to get closer (negative z)
                         //   - If perp < target (error < 0): turn LEFT to get farther (positive z)
                         
-                        vel.twist.angular.z = -following_side_ * 2.0f * distance_error;
-                        vel.twist.angular.z = std::clamp(vel.twist.angular.z, -0.5, 0.5);
+                        //vel.twist.angular.z = -following_side_ * 1.0f * distance_error;
+                        vel.twist.angular.z = -following_side_ * 1.0f;
+                        vel.twist.angular.z = std::clamp(vel.twist.angular.z,  -deg2rad(90), deg2rad(90));
                     }
                 }
                 //
@@ -603,15 +612,25 @@ public:
                 // =====================================================
                 else if (wf_sub_state_ == WallFollowSubState::FOLLOWING) 
                 {
+                    float wall_front, wall_back;
+        
+                    if (following_side_ == 1) {
+                        wall_front = laser_left_front_;
+                        wall_back = laser_left_back_;
+                    } else {
+                        wall_front = laser_right_front_;
+                        wall_back = laser_right_back_;
+                    }
+                                
                     // Target distance from wall
-                    const float DESIRED_DISTANCE = 0.40;  // 40cm from wall
+                    const float DESIRED_DISTANCE = 0.40f;  // 40cm from wall
                     
                     // ===== SUB-STEP 4A: Check front obstacle =====
-                    if (minLaserDistFront_ < 0.35) {
+                    if (minLaserDistFront_ < 0.5) {
                         // Obstacle ahead! Need to turn
                         RCLCPP_INFO(this->get_logger(), "Front obstacle! Turning away from wall");
                         
-                        vel.twist.linear.x = 0.05;  // Slow forward movement
+                        vel.twist.linear.x = 0.1;  // Slow forward movement
                         vel.twist.angular.z = following_side_ * 0.6;  // Turn away from wall
                         // (LEFT wall: turn right, RIGHT wall: turn left)
                     }
