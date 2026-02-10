@@ -32,7 +32,9 @@ enum class State {
     UNDOCKING,
     EXPLORATION,
     WALL_FOLLOW,
-    BUMPED
+    BUMPED, 
+    ROTATE_BY_MARGIN, 
+    MOVE_LINEAR_BY_MARGIN 
 };
 
 enum class WallFollowSubState {
@@ -97,6 +99,22 @@ public:
         
         alignment_locked_ = false;
         locked_target_distance_ = 0.0f;
+
+        rotate_angular_speed_ = deg2rad(45);
+        rotate_target_yaw_ = 0.0;
+        rotate_start_yaw_ = 0.0;
+        rotate_return_state_ = State::EXPLORATION;
+        
+        linear_start_x_ = 0.0;
+        linear_start_y_ = 0.0;
+        linear_target_distance_ = 0.0;
+        linear_speed_ = 0.25;
+        linear_return_state_ = State::EXPLORATION;
+        
+        // Initialize these too (you commented them out but still declared):
+        last_wall_follow_exit_time_ = this->now();
+        exploration_start_x_ = 0.0;
+        exploration_start_y_ = 0.0;
 
         RCLCPP_INFO(this->get_logger(), "Contest 1 node initialized. State: UNDOCKING.");
     }
@@ -291,9 +309,13 @@ public:
 
     // --- State Transition Helpers ---
     void enterExplorationState() {
+
         RCLCPP_INFO(this->get_logger(), "State: EXPLORATION");
         current_state_ = State::EXPLORATION;
         alignment_locked_ = false;
+        //last_wall_follow_exit_time_ = this->now();
+        //exploration_start_x_ = pos_x_;
+        //exploration_start_y_ = pos_y_;
         stopRobot();
     }
 
@@ -327,6 +349,38 @@ public:
         RCLCPP_INFO(this->get_logger(), "State: BUMPED");
         current_state_ = State::BUMPED;
         bump_sub_state_ = BumpSubState::CHECK_SENSORS;
+        stopRobot();
+    }
+
+    /**
+     * @brief Rotate by a specific angle, then return to a specified state
+     * @param angle_deg Angle to rotate in degrees (positive = CCW, negative = CW)
+     * @param return_state State to transition to after rotation completes
+     */
+    void enterRotateByMargin(double angle_deg, State return_state) {
+        RCLCPP_INFO(this->get_logger(), "State: ROTATE_BY_MARGIN (%.1f degrees)", angle_deg);
+        current_state_ = State::ROTATE_BY_MARGIN;
+        rotate_return_state_ = return_state;
+        rotate_start_yaw_ = yaw_;
+        rotate_target_yaw_ = normalize_angle(yaw_ + deg2rad(angle_deg));
+        stopRobot();
+    }
+
+    /**
+     * @brief Move linearly by a specific distance, then return to a specified state
+     * @param distance_m Distance to move in meters (positive = forward, negative = backward)
+     * @param speed_mps Speed in m/s (will be signed based on distance)
+     * @param return_state State to transition to after movement completes
+     */
+    void enterMoveLinearByMargin(double distance_m, double speed_mps, State return_state) {
+        RCLCPP_INFO(this->get_logger(), "State: MOVE_LINEAR_BY_MARGIN (%.2fm at %.2fm/s)", 
+                    distance_m, speed_mps);
+        current_state_ = State::MOVE_LINEAR_BY_MARGIN;
+        linear_return_state_ = return_state;
+        linear_start_x_ = pos_x_;
+        linear_start_y_ = pos_y_;
+        linear_target_distance_ = std::abs(distance_m);
+        linear_speed_ = (distance_m >= 0) ? std::abs(speed_mps) : -std::abs(speed_mps);
         stopRobot();
     }
 
@@ -365,6 +419,40 @@ public:
                 }
                 break;
             }
+            
+            // case State::EXPLORATION:
+            // {
+            //     double time_since_exit = (this->now() - last_wall_follow_exit_time_).seconds();
+            //     double dist_from_start = std::hypot(
+            //         pos_x_ - exploration_start_x_, 
+            //         pos_y_ - exploration_start_y_
+            //     );
+            //     const double WALL_FOLLOW_COOLDOWN = 3.0;      // 3 seconds
+            //     const double MIN_EXPLORATION_DISTANCE = 0.5;  // 0.5 meters
+            //     bool cooldown_expired = (time_since_exit > WALL_FOLLOW_COOLDOWN);
+            //     bool far_enough = (dist_from_start > MIN_EXPLORATION_DISTANCE);
+            //     bool can_enter_wall_follow = cooldown_expired && far_enough;
+            //     if (minLaserDistFront_ < 0.5 && can_enter_wall_follow) {
+            //         if (minLaserDistLeft_true_ < minLaserDistRight_true_) {
+            //             RCLCPP_INFO(this->get_logger(), "Left Wall Selected");
+            //         } else {
+            //             RCLCPP_INFO(this->get_logger(), "Right Wall Selected");
+            //         }
+            //         enterWallFollowState();
+            //     } else if (minLaserDistFront_ < 0.5){
+            //         RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
+            //                             "Wall detected but need to move away first (%.2fm/%.2fm)", 
+            //                             dist_from_start, MIN_EXPLORATION_DISTANCE);
+            //         vel.twist.linear.x = 0.0;
+            //         vel.twist.angular.z = 0.5;  // Turn
+            //         vel_pub_->publish(vel);
+            //     } else {
+            //         vel.twist.linear.x = 0.25;
+            //         vel_pub_->publish(vel);
+            //     }
+            //     break;
+            // }
+ 
 
             case State::EXPLORATION:
             {
@@ -381,18 +469,39 @@ public:
                 }
                 break;
             }
-            /*
+
             case State::WALL_FOLLOW:
             {
-                float wall_center = locked_target_distance_;
+                // =====================================================
+                // STEP 1: Check which wall we're following
+                // =====================================================
+                float wall_center_instantaneous;
                 
-                if (wall_center > 1.0f) {
-                    RCLCPP_WARN(this->get_logger(), "Wall lost! (dist=%.2fm)", wall_center);
-                    enterExplorationState();
+                if (following_side_ == 1) {
+                    wall_center_instantaneous = minLaserDistLeft_medium_;
+                } else {
+                    wall_center_instantaneous = minLaserDistRight_medium_;
+                }
+                
+                // ===== IMPROVED WALL LOST DETECTION =====
+                bool wall_lost = (wall_center_instantaneous > 1.0f);
+                bool front_obstacle = (minLaserDistFront_ < 0.5f);
+                
+                if (wall_lost && !front_obstacle) {
+                    // Wall genuinely lost AND no obstacle ahead
+                    RCLCPP_WARN(this->get_logger(), "Wall lost! (dist=%.2fm)", wall_center_instantaneous);
+                    
+                    // Move away before exploring
+                    double escape_angle = -following_side_ * 90.0;  // Turn away from wall side
+                    enterRotateByMargin(escape_angle, State::EXPLORATION);
                     break;
                 }
-                            
+                
+                // =====================================================
+                // STEP 2: ALIGNING - Turn toward the more open side
+                // =====================================================
                 if (wf_sub_state_ == WallFollowSubState::ALIGNING) {
+                    
                     float current_perpendicular = (following_side_ == 1) ? minLaserDistLeft_ : minLaserDistRight_;
                     float distance_error = current_perpendicular - locked_target_distance_;
                     
@@ -405,7 +514,7 @@ public:
                         distance_error
                     );
                     
-                    if (std::abs(distance_error) < 0.01f) {
+                    if (std::abs(distance_error) < 0.02f) {
                         RCLCPP_INFO(this->get_logger(), 
                             "✓ ALIGNED! Perpendicular sensor matches target (%.3fm). Starting FOLLOWING.",
                             current_perpendicular
@@ -418,141 +527,17 @@ public:
                         vel.twist.angular.z = std::clamp(vel.twist.angular.z, -deg2rad(45), deg2rad(45));
                     }
                 }
-                else if (wf_sub_state_ == WallFollowSubState::FOLLOWING) 
-                {
-                    float wall_front, wall_back, wall_center_instantaneous_;
-        
-                    if (following_side_ == 1) {
-                        wall_front = laser_left_front_;
-                        wall_center_instantaneous_ = minLaserDistLeft_medium_;
-                        wall_back = laser_left_back_;
-                    } else {
-                        wall_front = laser_right_front_;
-                        wall_center_instantaneous_ = minLaserDistRight_medium_;
-                        wall_back = laser_right_back_;
-                    }
-                                
-                    const float DESIRED_DISTANCE = 0.40f;
-                    
-                    if (minLaserDistFront_ < 0.5) {
-                        RCLCPP_INFO(this->get_logger(), "Front obstacle!");
-                        vel.twist.linear.x = 0.0;
-                        vel.twist.angular.z = following_side_ * 0.6;
-                    } else {
-                        float distance_error = DESIRED_DISTANCE - wall_center_instantaneous_;
-                        float parallelism_error = wall_front - wall_back;
-                        
-                        vel.twist.linear.x = 0.15;
-                        
-                        float Kp_distance = 1.5;
-                        float Kp_parallel = 2.0;
-                        
-                        float angular_from_distance = -following_side_ * Kp_distance * distance_error;
-                        float angular_from_parallel = -following_side_ * Kp_parallel * parallelism_error;
-                        
-                        vel.twist.angular.z = angular_from_distance + angular_from_parallel;
-                        vel.twist.angular.z = std::clamp(vel.twist.angular.z, -0.6, 0.6);
-                        
-                        RCLCPP_INFO_THROTTLE(
-                            this->get_logger(), *this->get_clock(), 1000,
-                            "Following: Dist=%.2fm(err=%.2f), Parallel=%.3fm, ω=%.2f",
-                            wall_center, distance_error, parallelism_error, vel.twist.angular.z
-                        );
-                    }
-                    
-                    double elapsed_time = (this->now() - wall_follow_start_time_).seconds();
-                    
-                    if (elapsed_time > 10.0) {
-                        double dist_to_start = std::hypot(
-                            pos_x_ - wall_follow_start_x_, 
-                            pos_y_ - wall_follow_start_y_
-                        );
-                        
-                        if (dist_to_start < 0.4) {
-                            RCLCPP_INFO(this->get_logger(), 
-                                "Loop closure detected! Completed circuit in %.1f seconds", 
-                                elapsed_time
-                            );
-                            enterExplorationState();
-                        }
-                    }
-                }
-                
-                break;
-            }
-            */
-
-            case State::WALL_FOLLOW:
-            {
-                // =====================================================
-                // STEP 1: Check which wall we're following
-                // =====================================================
-                float wall_center_instantaneous;
-                
-                if (following_side_ == 1) {
-                    // Following LEFT wall - monitor left side distance
-                    wall_center_instantaneous = minLaserDistLeft_medium_;
-                } else {
-                    // Following RIGHT wall - monitor right side distance
-                    wall_center_instantaneous = minLaserDistRight_medium_;
-                }
-                
-                // Check if wall is still visible
-                if (wall_center_instantaneous > 1.0f) {
-                    RCLCPP_WARN(this->get_logger(), "Wall lost! (dist=%.2fm)", wall_center_instantaneous);
-                    enterExplorationState();
-                    break;
-                } 
-                // =====================================================
-                // STEP 2: ALIGNING - Turn toward the more open side
-                // =====================================================
-                if (wf_sub_state_ == WallFollowSubState::ALIGNING) {
-                    
-                    // Get current perpendicular sensor reading
-                    float current_perpendicular = (following_side_ == 1) ? minLaserDistLeft_ : minLaserDistRight_;
-                    
-                    // Calculate distance error: we want perpendicular to match locked target
-                    float distance_error = current_perpendicular - locked_target_distance_;
-                    
-                    RCLCPP_INFO_THROTTLE(
-                        this->get_logger(), *this->get_clock(), 500,
-                        "ALIGNING %s: Perp=%.3fm, Target=%.3fm, Error=%.3fm",
-                        (following_side_ == 1) ? "LEFT" : "RIGHT",
-                        current_perpendicular, 
-                        locked_target_distance_, 
-                        distance_error
-                    );
-                    
-                    // Check if aligned (within 1cm)
-                    if (std::abs(distance_error) < 0.02f) {
-                        RCLCPP_INFO(this->get_logger(), 
-                            "✓ ALIGNED! Perpendicular sensor matches target (%.3fm). Starting FOLLOWING.",
-                            current_perpendicular
-                        );
-                        wf_sub_state_ = WallFollowSubState::FOLLOWING;
-                        stopRobot();
-                    } else {
-                        // Rotate to turn toward more open space
-                        // If following LEFT wall (closer): turn RIGHT (away from left wall)
-                        // If following RIGHT wall (closer): turn LEFT (away from right wall)
-                        vel.twist.linear.x = 0.0;  // Pure rotation
-                        vel.twist.angular.z = -following_side_ * 1.0f;  // Turn toward open space
-                        vel.twist.angular.z = std::clamp(vel.twist.angular.z, -deg2rad(45), deg2rad(45));
-                    }
-                }
                 // =====================================================
                 // STEP 3: FOLLOWING - Maintain distance from wall
                 // =====================================================
                 else if (wf_sub_state_ == WallFollowSubState::FOLLOWING) 
                 {
                     float wall_front, wall_back;
-        
+
                     if (following_side_ == 1) {
-                        // Following LEFT wall - check front-left and back-left
                         wall_front = laser_left_front_;
                         wall_back = laser_left_back_;
                     } else {
-                        // Following RIGHT wall - check front-right and back-right
                         wall_front = laser_right_front_;
                         wall_back = laser_right_back_;
                     }
@@ -563,38 +548,21 @@ public:
                     if (minLaserDistFront_ < 0.5) {
                         RCLCPP_INFO(this->get_logger(), "Front obstacle!");
                         vel.twist.linear.x = 0.0;
-                        vel.twist.angular.z = -following_side_ * 0.6;  // Turn AWAY from wall (toward open space)
-                        // LEFT wall: turn right, RIGHT wall: turn left
+                        vel.twist.angular.z = -following_side_ * 0.6;
                     } 
                     // ===== Normal wall following =====
                     else {
-                        // Calculate control errors
                         float distance_error = wall_center_instantaneous - DESIRED_DISTANCE;
                         float parallelism_error = wall_front - wall_back;
                         
                         vel.twist.linear.x = 0.15;
                         
-                        float Kp_distance = 6;
+                        float Kp_distance = 6.0;
                         float Kp_parallel = 0.0;
                         
-                        // Distance control (CORRECTED LOGIC):
-                        // - If distance INCREASING (error > 0, wall getting farther): turn TOWARD wall
-                        // - If distance DECREASING (error < 0, wall getting closer): turn AWAY from wall
-                        //
-                        // For LEFT wall (side=1):
-                        //   - wall farther (error > 0): turn LEFT toward wall (positive z)
-                        //   - wall closer (error < 0): turn RIGHT away from wall (negative z)
-                        // For RIGHT wall (side=-1):
-                        //   - wall farther (error > 0): turn RIGHT toward wall (negative z)
-                        //   - wall closer (error < 0): turn LEFT away from wall (positive z)
                         float angular_from_distance = following_side_ * Kp_distance * distance_error;
-                        
-                        // Parallelism control:
-                        // - If front closer (error < 0): turn away from wall
-                        // - If back closer (error > 0): turn toward wall
                         float angular_from_parallel = -following_side_ * Kp_parallel * parallelism_error;
                         
-                        // Combine both controllers
                         vel.twist.angular.z = angular_from_distance + angular_from_parallel;
                         vel.twist.angular.z = std::clamp(vel.twist.angular.z, -0.6, 0.6);
                         
@@ -605,7 +573,7 @@ public:
                         );
                     }
                     
-                    // ===== Loop closure check =====
+                    // ===== ENHANCED LOOP CLOSURE CHECK =====
                     double elapsed_time = (this->now() - wall_follow_start_time_).seconds();
                     
                     if (elapsed_time > 10.0) {
@@ -616,18 +584,22 @@ public:
                         
                         if (dist_to_start < 0.4) {
                             RCLCPP_INFO(this->get_logger(), 
-                                "Loop closure detected! Completed circuit in %.1f seconds", 
+                                "Loop closure detected! Completed circuit in %.1f seconds. Escaping...", 
                                 elapsed_time
                             );
-                            enterExplorationState();
+                        
+                        // Rotate away from wall, then explore
+                        double escape_angle = -following_side_ * 127.0;  // Turn away from wall
+                        enterRotateByMargin(escape_angle, State::EXPLORATION);
+                        break;
                         }
                     }
                 }
-                
                 break;
             }
-
-           case State::BUMPED:
+        
+                    
+            case State::BUMPED:
             {
                 switch (bump_sub_state_) {
                     case BumpSubState::CHECK_SENSORS:
@@ -697,6 +669,30 @@ public:
                 }
                 break;
             }
+
+            case State::ROTATE_BY_MARGIN:
+            {
+                double error = normalize_angle(rotate_target_yaw_ - yaw_);
+                if (std::abs(error) < 0.1) {
+                    RCLCPP_INFO(this->get_logger(), "Rotation complete");
+                    current_state_ = rotate_return_state_;
+                } else {
+                    vel.twist.angular.z = (error > 0) ? rotate_angular_speed_ : -rotate_angular_speed_;
+                }
+                break;
+            }
+
+            case State::MOVE_LINEAR_BY_MARGIN:
+            {
+                double dist = std::hypot(pos_x_ - linear_start_x_, pos_y_ - linear_start_y_);
+                if (dist >= linear_target_distance_) {
+                    RCLCPP_INFO(this->get_logger(), "Movement complete");
+                    current_state_ = linear_return_state_;
+                } else {
+                    vel.twist.linear.x = linear_speed_;
+                }
+                break;
+            }
         }
         vel_pub_->publish(vel);
     }
@@ -709,6 +705,7 @@ public:
     }
 
 private:
+
     rclcpp::Publisher<geometry_msgs::msg::TwistStamped>::SharedPtr vel_pub_;
     rclcpp::Subscription<sensor_msgs::msg::LaserScan>::SharedPtr laser_sub_;
     rclcpp::Subscription<irobot_create_msgs::msg::HazardDetectionVector>::SharedPtr hazard_sub_;
@@ -740,6 +737,10 @@ private:
     int undock_phase_;
     double undock_target_yaw_;
 
+    //Exploration
+    rclcpp::Time last_wall_follow_exit_time_;
+    double exploration_start_x_, exploration_start_y_;
+
     // Wall Follow
     bool alignment_locked_;
     float locked_target_distance_;
@@ -754,6 +755,19 @@ private:
     double original_yaw_before_bump_sequence_;
     double bump_target_yaw_;
     double bump_turn_direction_;
+
+    //Rotation Actuation
+    double rotate_target_yaw_;
+    double rotate_start_yaw_;
+    double rotate_angular_speed_;
+    State rotate_return_state_;
+    
+    //Linear Actuation
+    double linear_start_x_, linear_start_y_;
+    double linear_target_distance_;
+    double linear_speed_;
+    State linear_return_state_;  // State to return to after linear movement
+
 };
 
 int main(int argc, char** argv)
