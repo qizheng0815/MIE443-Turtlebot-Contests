@@ -116,7 +116,7 @@ public:
         const sensor_msgs::msg::LaserScan::SharedPtr& scan,
         double start_angle_deg,
         double end_angle_deg,
-        float min_valid_range = 0.05f,
+        float min_valid_range = 0.15f,
         int* out_min_index = nullptr
     ) {
         auto searchRange = [&](double start_deg, double end_deg, float& min_dist, int& min_idx) {
@@ -133,10 +133,10 @@ public:
             start_idx = std::clamp(start_idx, 0, num_readings - 1);
             end_idx = std::clamp(end_idx, 0, num_readings - 1);
             
-            // Ensure start <= end
-            if (start_idx > end_idx) {
-                std::swap(start_idx, end_idx);
-            }
+            // // Ensure start <= end
+            // if (start_idx > end_idx) {
+            //     std::swap(start_idx, end_idx);
+            // }
             
             // Find minimum distance in this range
             for (int i = start_idx; i <= end_idx; ++i) {
@@ -211,27 +211,27 @@ public:
         // ============================================
         
         // FRONT: -92° to -88° (centered at -90°)
-        minLaserDistFront_ = getMinLaserDistInRange(scan, -92.0, -88.0, 0.05f, &minDistIndexFront_);
+        minLaserDistFront_ = getMinLaserDistInRange(scan, -92.0, -88.0, 0.15f, &minDistIndexFront_);
         
         // LEFT (narrow): -2° to +2° (centered at 0°)
-        minLaserDistLeft_ = getMinLaserDistInRange(scan, -2.0, 2.0, 0.05f, &minDistIndexLeft_);
+        minLaserDistLeft_ = getMinLaserDistInRange(scan, -2.0, 2.0, 0.15f, &minDistIndexLeft_);
         
         // LEFT (wide): -90° to +90°
-        minLaserDistLeft_true_ = getMinLaserDistInRange(scan, -90.0, 90.0, 0.05f, &minDistIndexLeft_true_);
-        minLaserDistLeft_medium_ = getMinLaserDistInRange(scan, -30.0, 30.0, 0.05f, &minDistIndexLeft_medium_);
+        minLaserDistLeft_true_ = getMinLaserDistInRange(scan, -90.0, 90.0, 0.15f, &minDistIndexLeft_true_);
+        minLaserDistLeft_medium_ = getMinLaserDistInRange(scan, -30.0, 30.0, 0.15f, &minDistIndexLeft_medium_);
         
         // RIGHT (narrow): 178° to -178° (crosses ±180° boundary)
-        minLaserDistRight_ = getMinLaserDistInRange(scan, 178.0, -178.0, 0.05f, &minDistIndexRight_);
+        minLaserDistRight_ = getMinLaserDistInRange(scan, 178.0, -178.0, 0.15f, &minDistIndexRight_);
         
         // RIGHT (wide): 90° to -90° (crosses ±180° boundary)
-        minLaserDistRight_true_ = getMinLaserDistInRange(scan, 90.0, -90.0, 0.05f, &minDistIndexRight_true_);
-        minLaserDistRight_medium_ = getMinLaserDistInRange(scan, -150.0, 150.0, 0.05f, &minDistIndexRight_medium_);
+        minLaserDistRight_true_ = getMinLaserDistInRange(scan, 90.0, -90.0, 0.15f, &minDistIndexRight_true_);
+        minLaserDistRight_medium_ = getMinLaserDistInRange(scan, 150.0, -150.0, 0.15f, &minDistIndexRight_medium_);
         
         // LEFT FRONT RAY: -46° to -44°
         laser_left_front_ = getMinLaserDistInRange(scan, -46.0, -44.0);
         
-        // LEFT BACK RAY: +44° to +56°
-        laser_left_back_ = getMinLaserDistInRange(scan, 44.0, 56.0);
+        // LEFT BACK RAY: +44° to +46°
+        laser_left_back_ = getMinLaserDistInRange(scan, 44.0, 46.0);
         
         // RIGHT FRONT RAY: -136° to -134°
         laser_right_front_ = getMinLaserDistInRange(scan, -136.0, -134.0);
@@ -249,12 +249,12 @@ public:
         //     minLaserDistLeft_true_, minLaserDistRight_true_
         // );
 
-        // RCLCPP_INFO_THROTTLE(
-        //     this->get_logger(), *this->get_clock(), 500,
-        //     "F=%.2f L=%.2f R=%.2f B=%.2f | LF=%.2f LB=%.2f RF=%.2f RB=%.2f | LW = %.2f RW=%.2f, LM=%.2f RM=%.2f", 
-        //     minLaserDistFront_, minLaserDistLeft_, minLaserDistRight_, laser_back_,
-        //     laser_left_front_, laser_left_back_, laser_right_front_, laser_right_back_, minLaserDistLeft_true_, minLaserDistRight_true_, minLaserDistLeft_medium_, minLaserDistRight_medium_
-        // );
+        RCLCPP_INFO_THROTTLE(
+            this->get_logger(), *this->get_clock(), 500,
+            "F=%.2f L=%.2f R=%.2f B=%.2f | LF=%.2f LB=%.2f RF=%.2f RB=%.2f | LW = %.2f RW=%.2f, LM=%.2f RM=%.2f", 
+            minLaserDistFront_, minLaserDistLeft_, minLaserDistRight_, laser_back_,
+            laser_left_front_, laser_left_back_, laser_right_front_, laser_right_back_, minLaserDistLeft_true_, minLaserDistRight_true_, minLaserDistLeft_medium_, minLaserDistRight_medium_
+        );
     }
 
     void odomCallback(const nav_msgs::msg::Odometry::SharedPtr odom)
@@ -524,7 +524,7 @@ public:
                     );
                     
                     // Check if aligned (within 1cm)
-                    if (std::abs(distance_error) < 0.01f) {
+                    if (std::abs(distance_error) < 0.02f) {
                         RCLCPP_INFO(this->get_logger(), 
                             "✓ ALIGNED! Perpendicular sensor matches target (%.3fm). Starting FOLLOWING.",
                             current_perpendicular
@@ -574,7 +574,7 @@ public:
                         
                         vel.twist.linear.x = 0.15;
                         
-                        float Kp_distance = 2.5;
+                        float Kp_distance = 6;
                         float Kp_parallel = 0.0;
                         
                         // Distance control (CORRECTED LOGIC):
