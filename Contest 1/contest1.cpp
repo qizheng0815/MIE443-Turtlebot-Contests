@@ -71,7 +71,7 @@ public:
 
         // Initialize state
         start_time_ = this->now();
-        current_state_ = State::UNDOCKING;
+        current_state_ = State::EXPLORATION;
         undock_phase_ = 0;
         
         // Initialize odometry
@@ -80,6 +80,7 @@ public:
         yaw_ = 0.0;
         stuck_count_ = 0;
         last_position_check_time_ = this->now();
+        wall_lost_count_ = 0;
         
         // Initialize sensor values
         minLaserDistFront_ = std::numeric_limits<float>::infinity();
@@ -272,6 +273,8 @@ public:
         RCLCPP_INFO(this->get_logger(), "State: EXPLORATION");
         current_state_ = State::EXPLORATION;
         alignment_locked_ = false;
+        wall_lost_count_ = 0;  // Clear wall lost counter
+        RCLCPP_INFO(this->get_logger(), "Wall lost counter cleared");
         stopRobot();
     }
 
@@ -445,11 +448,22 @@ public:
                 }
                 
                 // Wall lost detection
-                bool wall_lost = (wall_center_instantaneous > 0.8f);
-                bool front_obstacle = (minLaserDistFront_wider_ < 0.75f);
-                
+                bool wall_lost = (wall_center_instantaneous > 2.5f);
+                bool front_obstacle = (minLaserDistFront_ < 1.0f);
+     
                 if (wall_lost && !front_obstacle) {
-                    RCLCPP_WARN(this->get_logger(), "Wall lost! (dist=%.2fm)", wall_center_instantaneous);
+                     wall_lost_count_++;  // Increment counter
+                    RCLCPP_WARN(this->get_logger(), 
+                    "Wall lost! (dist=%.2fm) [Count: %d]", 
+                    wall_center_instantaneous, wall_lost_count_);
+                    if (wall_lost_count_ >= 3) {
+                        RCLCPP_ERROR(this->get_logger(), 
+                            "Wall lost %d times! Giving up on wall follow, entering EXPLORATION", 
+                            wall_lost_count_);
+                        enterExplorationState();
+                        break;
+                    }
+                    
                     skip_alignment_ = true;
                     double escape_angle = following_side_ * 60.0;
                     enterRotateByMargin(escape_angle, State::WALL_FOLLOW);
@@ -477,7 +491,7 @@ public:
                         break;
                     }
                     
-                    if (std::abs(distance_error) < 0.02f) {
+                    if (std::abs(distance_error) < 0.05f) {
                         RCLCPP_INFO(this->get_logger(), 
                             "✓ ALIGNED! Perpendicular sensor matches target (%.3fm). Starting FOLLOWING.",
                             current_perpendicular
@@ -539,7 +553,7 @@ public:
                             pos_y_ - wall_follow_start_y_
                         );
                         
-                        if (dist_to_start < 0.4) {
+                        if (dist_to_start < 1.2) {
                             RCLCPP_INFO(this->get_logger(), 
                                 "Loop closure detected! Completed circuit in %.1f seconds. Escaping...", 
                                 elapsed_time
@@ -558,9 +572,9 @@ public:
                 switch (bump_sub_state_) {
                     case BumpSubState::CHECK_SENSORS:
                     {
-                        if (minLaserDistLeft_true_ < 0.2 || minLaserDistRight_true_ < 0.2) {
+                        if (minLaserDistFront_wider_ < 0.2f) {
                             skip_alignment_ = true;
-                            enterWallFollowState();
+                            enterMoveLinearByMargin(-0.5, 0.1, State::WALL_FOLLOW);
                         } else {
                             bump_start_x_ = pos_x_;
                             bump_start_y_ = pos_y_;
@@ -608,7 +622,7 @@ public:
                         if (yaw_diff < 0.1) {
                             enterExplorationState();
                         } else {
-                            vel.twist.linear.x = 0.05;
+                            vel.twist.linear.x = 0.1;
                             vel.twist.angular.z = -1.0 * bump_turn_direction_ * 0.5;
                         }
                         break;
@@ -697,7 +711,7 @@ private:
     double wall_follow_start_x_, wall_follow_start_y_;
     rclcpp::Time wall_follow_start_time_;
     rclcpp::Time alignment_start_time_;
-    const double ALIGNMENT_TIMEOUT = 10.0;
+    const double ALIGNMENT_TIMEOUT = 5;
     bool skip_alignment_;
 
     // Bump handling
@@ -722,10 +736,13 @@ private:
     // Stuck detection
     std::deque<std::pair<double, double>> position_history_;
     rclcpp::Time last_position_check_time_;
-    const double POSITION_CHECK_INTERVAL = 5.0;
+    const double POSITION_CHECK_INTERVAL = 3.0;
     const double STUCK_THRESHOLD = 0.25;
     int stuck_count_;
     const int MAX_STUCK_COUNT = 5;
+        
+    // Wall lost counter
+    int wall_lost_count_;
 };
 
 int main(int argc, char** argv)
