@@ -73,7 +73,8 @@ public:
             100ms, std::bind(&Contest1Node::controlLoop, this));
 
         start_time_ = this->now();
-        current_state_ = State::UNDOCKING;
+        // current_state_ = State::UNDOCKING;
+        current_state_ = State::EXPLORATION;
         undock_phase_ = 0;
         
         pos_x_ = 0.0; pos_y_ = 0.0; yaw_ = 0.0;
@@ -386,7 +387,7 @@ public:
 
     void controlLoop()
     {
-        if ((this->now() - start_time_).seconds() >= 1000.0) {
+        if ((this->now() - start_time_).seconds() >= 480.0) {
             stopRobot();
             rclcpp::shutdown();
             return;
@@ -420,40 +421,6 @@ public:
                 break;
             }
             
-            // case State::EXPLORATION:
-            // {
-            //     double time_since_exit = (this->now() - last_wall_follow_exit_time_).seconds();
-            //     double dist_from_start = std::hypot(
-            //         pos_x_ - exploration_start_x_, 
-            //         pos_y_ - exploration_start_y_
-            //     );
-            //     const double WALL_FOLLOW_COOLDOWN = 3.0;      // 3 seconds
-            //     const double MIN_EXPLORATION_DISTANCE = 0.5;  // 0.5 meters
-            //     bool cooldown_expired = (time_since_exit > WALL_FOLLOW_COOLDOWN);
-            //     bool far_enough = (dist_from_start > MIN_EXPLORATION_DISTANCE);
-            //     bool can_enter_wall_follow = cooldown_expired && far_enough;
-            //     if (minLaserDistFront_ < 0.5 && can_enter_wall_follow) {
-            //         if (minLaserDistLeft_true_ < minLaserDistRight_true_) {
-            //             RCLCPP_INFO(this->get_logger(), "Left Wall Selected");
-            //         } else {
-            //             RCLCPP_INFO(this->get_logger(), "Right Wall Selected");
-            //         }
-            //         enterWallFollowState();
-            //     } else if (minLaserDistFront_ < 0.5){
-            //         RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
-            //                             "Wall detected but need to move away first (%.2fm/%.2fm)", 
-            //                             dist_from_start, MIN_EXPLORATION_DISTANCE);
-            //         vel.twist.linear.x = 0.0;
-            //         vel.twist.angular.z = 0.5;  // Turn
-            //         vel_pub_->publish(vel);
-            //     } else {
-            //         vel.twist.linear.x = 0.25;
-            //         vel_pub_->publish(vel);
-            //     }
-            //     break;
-            // }
- 
-
             case State::EXPLORATION:
             {
                 if (minLaserDistFront_ < 0.5) {
