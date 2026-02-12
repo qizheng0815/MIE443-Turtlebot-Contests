@@ -73,14 +73,15 @@ public:
             100ms, std::bind(&Contest1Node::controlLoop, this));
 
         start_time_ = this->now();
-        // current_state_ = State::UNDOCKING;
-        current_state_ = State::EXPLORATION;
+         current_state_ = State::UNDOCKING;
+        //current_state_ = State::EXPLORATION;
         undock_phase_ = 0;
         
         pos_x_ = 0.0; pos_y_ = 0.0; yaw_ = 0.0;
         
         // Initial sensor values
         minLaserDistFront_ = std::numeric_limits<float>::infinity();
+        minLaserDistFront_wider_ = std::numeric_limits<float>::infinity();
         minLaserDistRight_ = std::numeric_limits<float>::infinity();
         minLaserDistLeft_  = std::numeric_limits<float>::infinity();
         minLaserDistLeft_true_ = std::numeric_limits<float>::infinity();
@@ -97,6 +98,7 @@ public:
         minDistIndexLeft_true_ = -1;
         minDistIndexRight_medium_ = -1;
         minDistIndexLeft_medium_ = -1;
+        minDistIndexFront_wider_ = -1;
         
         alignment_locked_ = false;
         locked_target_distance_ = 0.0f;
@@ -204,6 +206,7 @@ public:
     {
         // Reset all minimum distances
         minLaserDistFront_ = std::numeric_limits<float>::infinity();
+        minLaserDistFront_wider_ = std::numeric_limits<float>::infinity();
         minLaserDistRight_ = std::numeric_limits<float>::infinity();
         minLaserDistLeft_  = std::numeric_limits<float>::infinity();
         minLaserDistLeft_true_ = std::numeric_limits<float>::infinity();
@@ -217,6 +220,7 @@ public:
         laser_back_        = std::numeric_limits<float>::infinity();
 
         minDistIndexFront_ = -1;
+        minDistIndexFront_wider_ = -1;
         minDistIndexRight_ = -1;
         minDistIndexLeft_  = -1;
         minDistIndexLeft_true_ = -1;
@@ -224,27 +228,27 @@ public:
         minDistIndexRight_medium_ = -1;
         minDistIndexLeft_medium_ = -1;
 
-
         // ============================================
         // Use helper function for all sensor readings
         // ============================================
         
         // FRONT: -92° to -88° (centered at -90°)
         minLaserDistFront_ = getMinLaserDistInRange(scan, -92.0, -88.0, 0.15f, &minDistIndexFront_);
+        minLaserDistFront_wider_ = getMinLaserDistInRange(scan, -105.0, -75.0, 0.15f, &minDistIndexFront_);
         
         // LEFT (narrow): -2° to +2° (centered at 0°)
         minLaserDistLeft_ = getMinLaserDistInRange(scan, -2.0, 2.0, 0.15f, &minDistIndexLeft_);
         
         // LEFT (wide): -90° to +90°
         minLaserDistLeft_true_ = getMinLaserDistInRange(scan, -90.0, 90.0, 0.15f, &minDistIndexLeft_true_);
-        minLaserDistLeft_medium_ = getMinLaserDistInRange(scan, -30.0, 30.0, 0.15f, &minDistIndexLeft_medium_);
+        minLaserDistLeft_medium_ = getMinLaserDistInRange(scan, -15.0, 15.0, 0.15f, &minDistIndexLeft_medium_);
         
         // RIGHT (narrow): 178° to -178° (crosses ±180° boundary)
         minLaserDistRight_ = getMinLaserDistInRange(scan, 178.0, -178.0, 0.15f, &minDistIndexRight_);
         
         // RIGHT (wide): 90° to -90° (crosses ±180° boundary)
         minLaserDistRight_true_ = getMinLaserDistInRange(scan, 90.0, -90.0, 0.15f, &minDistIndexRight_true_);
-        minLaserDistRight_medium_ = getMinLaserDistInRange(scan, 150.0, -150.0, 0.15f, &minDistIndexRight_medium_);
+        minLaserDistRight_medium_ = getMinLaserDistInRange(scan, 165.0, -165.0, 0.15f, &minDistIndexRight_medium_);
         
         // LEFT FRONT RAY: -46° to -44°
         laser_left_front_ = getMinLaserDistInRange(scan, -46.0, -44.0);
@@ -269,7 +273,7 @@ public:
         // );
 
         RCLCPP_INFO_THROTTLE(
-            this->get_logger(), *this->get_clock(), 500,
+            this->get_logger(), *this->get_clock(), 2000,
             "F=%.2f L=%.2f R=%.2f B=%.2f | LF=%.2f LB=%.2f RF=%.2f RB=%.2f | LW = %.2f RW=%.2f, LM=%.2f RM=%.2f", 
             minLaserDistFront_, minLaserDistLeft_, minLaserDistRight_, laser_back_,
             laser_left_front_, laser_left_back_, laser_right_front_, laser_right_back_, minLaserDistLeft_true_, minLaserDistRight_true_, minLaserDistLeft_medium_, minLaserDistRight_medium_
@@ -387,7 +391,7 @@ public:
 
     void controlLoop()
     {
-        if ((this->now() - start_time_).seconds() >= 480.0) {
+        if ((this->now() - start_time_).seconds() >= 100000.0) {
             stopRobot();
             rclcpp::shutdown();
             return;
@@ -423,7 +427,7 @@ public:
             
             case State::EXPLORATION:
             {
-                if (minLaserDistFront_ < 0.5) {
+                if (minLaserDistFront_wider_ < 0.5) {
                     if (minLaserDistLeft_true_ < minLaserDistRight_true_) {
                         RCLCPP_INFO(this->get_logger(), "Left Wall Selected");
                     } else {
@@ -451,16 +455,16 @@ public:
                 }
                 
                 // ===== IMPROVED WALL LOST DETECTION =====
-                bool wall_lost = (wall_center_instantaneous > 1.0f);
-                bool front_obstacle = (minLaserDistFront_ < 0.5f);
+                bool wall_lost = (wall_center_instantaneous > 0.8f);
+                bool front_obstacle = (minLaserDistFront_wider_ < 0.75f);
                 
                 if (wall_lost && !front_obstacle) {
                     // Wall genuinely lost AND no obstacle ahead
                     RCLCPP_WARN(this->get_logger(), "Wall lost! (dist=%.2fm)", wall_center_instantaneous);
                     
                     // Move away before exploring
-                    double escape_angle = -following_side_ * 90.0;  // Turn away from wall side
-                    enterRotateByMargin(escape_angle, State::EXPLORATION);
+                    double escape_angle = following_side_ * 60.0;  // Turn away from wall side
+                    enterRotateByMargin(escape_angle, State::WALL_FOLLOW);
                     break;
                 }
                 
@@ -487,6 +491,9 @@ public:
                             current_perpendicular
                         );
                         wf_sub_state_ = WallFollowSubState::FOLLOWING;
+                        wall_follow_start_x_ = pos_x_;
+                        wall_follow_start_y_ = pos_y_;
+                        wall_follow_start_time_ = this->now();
                         stopRobot();
                     } else {
                         vel.twist.linear.x = 0.0;
@@ -509,7 +516,7 @@ public:
                         wall_back = laser_right_back_;
                     }
                                 
-                    const float DESIRED_DISTANCE = 0.40f;
+                    const float DESIRED_DISTANCE = 0.50f;
                     
                     // ===== Check for front obstacle =====
                     if (minLaserDistFront_ < 0.5) {
@@ -522,16 +529,16 @@ public:
                         float distance_error = wall_center_instantaneous - DESIRED_DISTANCE;
                         float parallelism_error = wall_front - wall_back;
                         
-                        vel.twist.linear.x = 0.15;
+                        vel.twist.linear.x = 0.18;
                         
-                        float Kp_distance = 6.0;
+                        float Kp_distance = 0.8;
                         float Kp_parallel = 0.0;
                         
                         float angular_from_distance = following_side_ * Kp_distance * distance_error;
-                        float angular_from_parallel = -following_side_ * Kp_parallel * parallelism_error;
+                        float angular_from_parallel = following_side_ * Kp_parallel * parallelism_error;
                         
                         vel.twist.angular.z = angular_from_distance + angular_from_parallel;
-                        vel.twist.angular.z = std::clamp(vel.twist.angular.z, -0.6, 0.6);
+                        vel.twist.angular.z = std::clamp(vel.twist.angular.z, -1.6, 1.6);
                         
                         RCLCPP_INFO_THROTTLE(
                             this->get_logger(), *this->get_clock(), 1000,
@@ -543,7 +550,7 @@ public:
                     // ===== ENHANCED LOOP CLOSURE CHECK =====
                     double elapsed_time = (this->now() - wall_follow_start_time_).seconds();
                     
-                    if (elapsed_time > 10.0) {
+                    if (elapsed_time > 20.0) {
                         double dist_to_start = std::hypot(
                             pos_x_ - wall_follow_start_x_, 
                             pos_y_ - wall_follow_start_y_
@@ -571,7 +578,7 @@ public:
                 switch (bump_sub_state_) {
                     case BumpSubState::CHECK_SENSORS:
                     {
-                        if (minLaserDistFront_ < 0.1) {
+                        if (minLaserDistLeft_true_ < 0.2 || minLaserDistRight_true_ < 0.2) {
                             enterWallFollowState();
                         } else {
                             // Prepare backing up
@@ -586,7 +593,7 @@ public:
                     {
                         double dist = std::hypot(pos_x_ - bump_start_x_, pos_y_ - bump_start_y_);
                         if (dist < 0.1) {
-                            vel.twist.linear.x = -0.05; // Reverse
+                            vel.twist.linear.x = -0.1; // Reverse
                         } else {
                             // Done backing up, calculate turn
                             stopRobot();
@@ -687,10 +694,12 @@ private:
     // Sensor Data
     std::string last_bumped_frame_;
     float minLaserDistFront_;
+    float minLaserDistFront_wider_;
     float minLaserDistLeft_, minLaserDistRight_;
     float minLaserDistLeft_true_, minLaserDistRight_true_;
     float minLaserDistLeft_medium_, minLaserDistRight_medium_;
     int minDistIndexFront_;
+    int minDistIndexFront_wider_;
     int minDistIndexLeft_, minDistIndexRight_;
     int minDistIndexLeft_true_, minDistIndexRight_true_;
     int minDistIndexLeft_medium_, minDistIndexRight_medium_;
