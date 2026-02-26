@@ -24,7 +24,7 @@
 WORKSPACE_DIR="$HOME/ros2_ws"
 LAUNCH_RVIZ=true
 SKIP_BUILD=false
-MAP_FILE="${WORKSPACE_DIR}/src/mie443_contest1/mie443_contest1/worlds/practice_scene1.yaml"
+MAP_FILE="${WORKSPACE_DIR}/src/mie443_contest2/mie443_contest2/maps/Contest2MapPractice.yaml"
 
 # ── Parse flags ────────────────────────────────────────────────────────────────
 while [[ $# -gt 0 ]]; do
