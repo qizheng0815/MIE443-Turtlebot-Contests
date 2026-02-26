@@ -8,11 +8,12 @@
 #   1. colcon build  (mie443_contest2)
 #   2. Gazebo              (empty world + SO-ARM101 model)
 #   3. ROS 2 Controllers   (joint_state_broadcaster, arm, gripper in Gazebo)
-#   4. MoveIt + RViz       (use_sim_time:=True)
-#   5. Nav2 localisation   (map server + AMCL, use_sim_time:=True)
-#   6. Nav2 navigation     (planners + controllers + bt_navigator, use_sim_time:=True)
-#   7. YOLO detector
-#   8. contest2            (use_sim_time:=true)
+#   4. TF frame fix        (static transform: base -> Base for RViz)
+#   5. MoveIt + RViz       (use_sim_time:=True)
+#   6. Nav2 localisation   (map server + AMCL, use_sim_time:=True)
+#   7. Nav2 navigation     (planners + controllers + bt_navigator, use_sim_time:=True)
+#   8. YOLO detector
+#   9. contest2            (use_sim_time:=true)
 #
 # Usage:
 #   bash ~/ros2_ws/contest2_launcher.bash
@@ -130,22 +131,36 @@ open_term() {
 }
 
 # ── Step 2: Gazebo ────────────────────────────────────────────────────────────
-echo "  [1/7] Starting Gazebo (SO-ARM101 in empty world)..."
+echo "  [1/8] Starting Gazebo (SO-ARM101 in empty world)..."
 open_term "Gazebo" \
-    "ros2 launch lerobot_description so101_gazebo.launch.py"
+    "export DISPLAY=${DISPLAY:-:0} && \
+     export GZ_SIM_GUI=1 && \
+     ros2 launch lerobot_description so101_gazebo.launch.py"
 
 echo "  Waiting 8 seconds for Gazebo to start..."
 sleep 8
 
 # ── Step 3: ROS 2 Controllers ─────────────────────────────────────────────────
-echo "  [2/7] Spawning ROS 2 controllers into Gazebo..."
+echo "  [2/8] Spawning ROS 2 controllers into Gazebo..."
 open_term "ROS2 Controllers" \
     "ros2 launch lerobot_controller so101_controller.launch.py is_sim:=True"
 
 sleep 3
 
-# ── Step 4: MoveIt move_group (+ optional RViz) ───────────────────────────────
-echo "  [3/7] Starting MoveIt (sim time)..."
+# ── Step 4: TF frame fix ───────────────────────────────────────────────────────
+# The RViz config expects fixed frame 'Base' (capital B) but the URDF publishes
+# 'base' (lowercase). This static transform bridges the two so RViz displays
+# the robot model correctly.
+echo "  [3/8] Publishing TF frame fix (base -> Base)..."
+open_term "TF Frame Fix" \
+    "ros2 run tf2_ros static_transform_publisher \
+     --frame-id base --child-frame-id Base \
+     --x 0 --y 0 --z 0 --roll 0 --pitch 0 --yaw 0"
+
+sleep 1
+
+# ── Step 5: MoveIt move_group (+ optional RViz) ───────────────────────────────
+echo "  [4/8] Starting MoveIt (sim time)..."
 if [ "$LAUNCH_RVIZ" = true ]; then
     open_term "MoveIt + RViz" \
         "ros2 launch lerobot_moveit so101_moveit.launch.py is_sim:=True"
@@ -159,7 +174,7 @@ echo "  Waiting 6 seconds for MoveIt to initialise..."
 sleep 6
 
 # ── Step 5: Nav2 localisation (map server + AMCL) ────────────────────────────
-echo "  [4/7] Starting Nav2 localisation..."
+echo "  [5/8] Starting Nav2 localisation..."
 open_term "Nav2 Localisation" \
     "ros2 launch nav2_bringup localization_launch.py \
      map:=${MAP_FILE} use_sim_time:=True"
@@ -168,21 +183,21 @@ echo "  Waiting 5 seconds for AMCL and map server..."
 sleep 5
 
 # ── Step 6: Nav2 navigation stack ────────────────────────────────────────────
-echo "  [5/7] Starting Nav2 navigation stack..."
+echo "  [6/8] Starting Nav2 navigation stack..."
 open_term "Nav2 Navigation" \
     "ros2 launch nav2_bringup navigation_launch.py use_sim_time:=True"
 
 sleep 5
 
 # ── Step 7: YOLO detector ────────────────────────────────────────────────────
-echo "  [6/7] Starting YOLO detector..."
+echo "  [7/8] Starting YOLO detector..."
 open_term "YOLO Detector" \
     "ros2 run mie443_contest2 yolo_detector.py"
 
 sleep 1
 
 # ── Step 8: contest2 ─────────────────────────────────────────────────────────
-echo "  [7/7] Starting contest2..."
+echo "  [8/8] Starting contest2..."
 open_term "Contest2" \
     "ros2 run mie443_contest2 contest2 --ros-args -p use_sim_time:=true"
 
