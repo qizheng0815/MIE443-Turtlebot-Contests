@@ -3,6 +3,10 @@
 # Usage: ./run_contest2_sim.sh [WORLD]
 #   WORLD: maze (default), warehouse, depot
 
+# Note: change the map directory
+# Note: ./run_contest2_sim.sh    run in terminal
+
+
 WORLD=${1:-maze}
 WS=~/ros2_ws
 ROS_DISTRO=jazzy
