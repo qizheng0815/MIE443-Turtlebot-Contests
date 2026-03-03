@@ -5,6 +5,9 @@ To apply robotics principles and algorithms on the turtlebot4 and the arm101 to 
 chmod +x launch_contest1.sh
 ./launch_contest1.sh
 
+# To launch Contest 2 Sim
+cd /home/admin1/ros2_ws && ./run_contest2_sim.sh
+
 # Linux Commands to switch between IRL and Simulation
 $ sudo nano /etc/turtlebot4/setup.bash #edit rwm_implementation
 $ source ~/.bashrc #save changes
