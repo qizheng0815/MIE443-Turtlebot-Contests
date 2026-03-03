@@ -23,6 +23,17 @@ pkill -f "ruby" 2>/dev/null
 sleep 3
 echo "Done."
 
+# --- Build ---
+echo "Building mie443_contest2..."
+cd ${WS} && colcon build --packages-select mie443_contest2
+if [ $? -ne 0 ]; then
+    echo "ERROR: Build failed. Fix errors before launching."
+    exit 1
+fi
+source ${WS}/install/setup.bash
+echo "Build complete."
+echo ""
+
 # Check for YOLO venv
 YOLO_ACTIVATE=""
 if [ -f ~/contest2/bin/activate ]; then
