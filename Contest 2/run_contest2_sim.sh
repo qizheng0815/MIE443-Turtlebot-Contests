@@ -10,8 +10,8 @@
 WORLD=${1:-maze}
 WS=~/ros2_ws
 ROS_DISTRO=jazzy
-MAP=${2:-/home/admin1/ros2_ws/src/mie443_contest2/mie443_contest2/mie443_contest2/maps/Contest2MapPractice.yaml}
-SOURCE="source /opt/ros/${ROS_DISTRO}/setup.bash && source ${WS}/install/setup.bash"
+MAP=${2:-/home/turtlebot/ros2_ws/src/mie443_contest2/mie443_contest2/maps/Contest2MapPractice.yaml}
+SOURCE="export CYCLONEDDS_URI=${WS}/cyclonedds_sim.xml && export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp && source /opt/ros/${ROS_DISTRO}/setup.bash && source ${WS}/install/setup.bash"
 
 # --- Cleanup previous session ---
 echo "Cleaning up previous processes..."
@@ -23,6 +23,7 @@ pkill -f "yolo_detector.py" 2>/dev/null
 pkill -f "ros2 run mie443_contest2 contest2" 2>/dev/null
 pkill -f "gzserver" 2>/dev/null
 pkill -f "gzclient" 2>/dev/null
+pkill -f "gz sim" 2>/dev/null
 pkill -f "ruby" 2>/dev/null
 sleep 3
 echo "Done."
@@ -59,12 +60,15 @@ gnome-terminal --title="2 Localization" -- bash -c "sleep 15 && ${SOURCE} && ros
 
 # 3. Nav2
 gnome-terminal --title="3 Nav2" -- bash -c "sleep 20 && ${SOURCE} && ros2 launch turtlebot4_navigation nav2.launch.py; exec bash" &
+sleep 1
 
 # 4. RViz
 gnome-terminal --title="4 RViz" -- bash -c "sleep 22 && ${SOURCE} && ros2 launch turtlebot4_viz view_navigation.launch.py; exec bash" &
+sleep 1
 
 # 5. YOLO Detector
 gnome-terminal --title="5 YOLO Detector" -- bash -c "sleep 15 && ${YOLO_ACTIVATE} ${SOURCE} && ros2 run mie443_contest2 yolo_detector.py; exec bash" &
+sleep 1
 
 # 6. Contest2 (manual trigger)
 gnome-terminal --title="6 Contest2 (RUN LAST)" -- bash -c "echo 'Wait for all other windows to finish starting, then press Enter to launch contest2...' && read && ${SOURCE} && ros2 run mie443_contest2 contest2; exec bash" &
