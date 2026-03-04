@@ -18,7 +18,7 @@ $ ros2 daemon stop
 $ ros2 daemon start
 $ ros2 topic list #show command list
 $ ros2 action send_goal /undock irobot_create_msgs/action/Undock "{}" #undocking turtlebot
-$ ros2 run teleop_twist_keyboard teleop_twist_keyboard #enable manual keyboard controls
+$ ros2 run teleop_twist_keyboard teleop_twist_keyboard --ros-args -r /cmd_vel:=/cmd_vel_unstamped #enable manual keyboard controls
 
 
 # IRL RVIZ and SLAM
