@@ -44,3 +44,6 @@ ros2 launch lerobot_moveit so101_turtlebot.launch.py
 #New Command Window
 cd ~/ros2_ws
 bash run_contest2_real.sh
+
+
+https://github.com/shengwen-tw/apriltag/blob/master/tag36h11.pdf
