@@ -4,14 +4,17 @@
 #include "mie443_contest2/yoloInterface.h"
 #include "mie443_contest2/arm_controller.h"
 #include "mie443_contest2/apriltag_detector.h"
+
 #include <rclcpp/rclcpp.hpp>
 #include <chrono>
-#include <fstream>
 #include <cmath>
+#include <fstream>
 #include <limits>
+#include <string>
+#include <thread>
 #include <vector>
 
-// Define states for the controller
+// ─── State machine ────────────────────────────────────────────────────────────
 enum RobotState {
     INIT,
     PICKUP_OBJECT,
@@ -21,176 +24,399 @@ enum RobotState {
     FINISHED
 };
 
-// Helper function to calculate Euclidean distance
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+
 double get_dist(double x1, double y1, double x2, double y2) {
-    return std::sqrt(std::pow(x1 - x2, 2) + std::pow(y1 - y2, 2));
+    return std::sqrt((x1 - x2) * (x1 - x2) + (y1 - y2) * (y1 - y2));
 }
 
-int main(int argc, char** argv) {
+/**
+ * Run YOLO detection up to max_attempts times.
+ * Returns the detection with the highest confidence above threshold.
+ * If save_image=true, saves the annotated image on the first successful attempt.
+ * Returns {class_name, confidence}; name is "" if nothing detected.
+ */
+std::pair<std::string, float> yoloRetry(
+    YoloInterface &yolo,
+    CameraSource cam,
+    bool save_image,
+    int max_attempts,
+    std::shared_ptr<rclcpp::Node> node)
+{
+    std::string best_name = "";
+    float best_conf = 0.0f;
+    bool image_saved = false;
+
+    for (int attempt = 0; attempt < max_attempts; ++attempt) {
+        // Only pass save_image=true on the first successful detection
+        bool do_save = save_image && !image_saved;
+        std::string name = yolo.getObjectName(cam, do_save);
+        if (!name.empty()) {
+            float conf = yolo.getConfidence();
+            if (do_save) image_saved = true;
+            if (conf > best_conf) {
+                best_conf = conf;
+                best_name = name;
+            }
+            if (conf >= 0.70f) break;  // Confident enough — stop early
+        }
+        if (attempt < max_attempts - 1) {
+            rclcpp::spin_some(node);
+            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        }
+    }
+    return {best_name, best_conf};
+}
+
+// Write the results file (called at RETURN_HOME and on timeout)
+void writeResults(
+    const std::string &manip_name,
+    float manip_conf,
+    const std::vector<std::vector<float>> &sorted_coords,
+    const std::vector<std::string> &scene_results,
+    bool placed,
+    bool timed_out)
+{
+    std::ofstream f("/home/turtlebot/contest2_report.txt");
+    if (timed_out) {
+        f << "=== MIE443 Contest 2 Results (INCOMPLETE - TIMEOUT) ===\n\n";
+    } else {
+        f << "=== MIE443 Contest 2 Results ===\n\n";
+    }
+
+    f << "Manipulable Object Detected:\n";
+    f << "  Name:       " << (manip_name.empty() ? "none" : manip_name) << "\n";
+    f << "  Confidence: " << manip_conf << "\n\n";
+
+    f << "Detected Scene Objects:\n";
+    for (size_t i = 0; i < sorted_coords.size(); ++i) {
+        std::string result = (i < scene_results.size()) ? scene_results[i] : "not_visited";
+        f << "  Box " << (i + 1)
+          << " (x=" << sorted_coords[i][0]
+          << ", y=" << sorted_coords[i][1] << "): "
+          << result << "\n";
+    }
+
+    f << "\nManipulable Object Placed in Bin: " << (placed ? "YES" : "NO") << "\n";
+    f.close();
+}
+
+// ─── Main ─────────────────────────────────────────────────────────────────────
+
+int main(int argc, char **argv) {
     rclcpp::init(argc, argv);
     auto node = std::make_shared<rclcpp::Node>("contest2");
 
-    // Initialize Subscribers and Helpers
+    // ── Pose subscriber ──────────────────────────────────────────────────────
     RobotPose robotPose(0, 0, 0);
     auto amclSub = node->create_subscription<geometry_msgs::msg::PoseWithCovarianceStamped>(
-        "/amcl_pose", 10, std::bind(&RobotPose::poseCallback, &robotPose, std::placeholders::_1));
+        "/amcl_pose", 10,
+        std::bind(&RobotPose::poseCallback, &robotPose, std::placeholders::_1));
 
+    // Wait up to 4 s for first AMCL pose
+    RCLCPP_INFO(node->get_logger(), "Waiting for AMCL pose...");
+    for (int i = 0; i < 20; ++i) {
+        rclcpp::spin_some(node);
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        if (robotPose.x != 0.0 || robotPose.y != 0.0) break;
+    }
+
+    // ── Box coordinates ──────────────────────────────────────────────────────
     Boxes boxes;
-    if(!boxes.load_coords()) {
+    if (!boxes.load_coords()) {
         RCLCPP_ERROR(node->get_logger(), "ERROR: could not load box coordinates");
         return -1;
     }
+    for (size_t i = 0; i < boxes.coords.size(); ++i) {
+        RCLCPP_INFO(node->get_logger(), "Box %zu: x=%.2f  y=%.2f  phi=%.2f",
+                    i, boxes.coords[i][0], boxes.coords[i][1], boxes.coords[i][2]);
+    }
 
+    // ── Components ───────────────────────────────────────────────────────────
     Navigation nav(node);
     YoloInterface yolo(node);
     ArmController arm(node);
-    AprilTagDetector tags(node, "map"); 
 
+    // apriltag_ros (36h11 family) publishes TF frames as "tag36h11:{id}"
+    // e.g. tag36h11:0, tag36h11:1, tag36h11:2, tag36h11:3, tag36h11:4
+    // Reference frame: arm_mount so getTagPose() returns coordinates directly
+    // usable by arm.moveToCartesianPose() without any additional transform.
+    AprilTagDetector tags(node, "tag36h11:", "arm_mount");
+
+    // ── Contest timer ────────────────────────────────────────────────────────
     auto start_time = std::chrono::system_clock::now();
     uint64_t secondsElapsed = 0;
+    constexpr uint64_t TIME_LIMIT = 300;  // 5 minutes
 
-    RobotState currentState = INIT;
-    
-    // Data Storage
-    double home_x = 0, home_y = 0, home_phi = 0;
-    std::string manipulable_obj_name = "";
+    RCLCPP_INFO(node->get_logger(), "Starting contest — 300-second timer begins now!");
+
+    // ── State variables ──────────────────────────────────────────────────────
+    RobotState state = INIT;
+    double home_x = 0.0, home_y = 0.0, home_phi = 0.0;
+    std::string manip_name = "";
+    float manip_conf = 0.0f;
     std::vector<std::vector<float>> sorted_coords;
-    std::vector<std::string> results_log;
-    size_t current_box_index = 0;
-    bool object_placed = false;
+    std::vector<std::string> scene_results;   // detected name at each location
+    size_t box_idx = 0;
+    bool placed = false;
+    int pickup_tries = 0;
 
-    while(rclcpp::ok() && secondsElapsed <= 300) {
+    // ── Main loop ────────────────────────────────────────────────────────────
+    while (rclcpp::ok() && secondsElapsed <= TIME_LIMIT) {
         rclcpp::spin_some(node);
         auto now = std::chrono::system_clock::now();
         secondsElapsed = std::chrono::duration_cast<std::chrono::seconds>(now - start_time).count();
+        uint64_t timeLeft = (secondsElapsed < TIME_LIMIT) ? (TIME_LIMIT - secondsElapsed) : 0;
 
-        switch(currentState) {
-            
-            case INIT: {
-                RCLCPP_INFO(node->get_logger(), "Initializing: Optimizing path using Nearest Neighbor...");
-                home_x = robotPose.x;
-                home_y = robotPose.y;
-                home_phi = robotPose.phi;
+        switch (state) {
 
-                // --- Nearest Neighbor Algorithm ---
-                std::vector<std::vector<float>> remaining = boxes.coords;
-                double cur_x = home_x;
-                double cur_y = home_y;
+        // ═══════════════════════════════════════════════════════════════════════
+        case INIT: {
+            home_x = robotPose.x;
+            home_y = robotPose.y;
+            home_phi = robotPose.phi;
+            RCLCPP_INFO(node->get_logger(), "INIT: Home = (%.2f, %.2f, %.2f)",
+                        home_x, home_y, home_phi);
 
-                while (!remaining.empty()) {
-                    int best_idx = 0;
-                    double min_dist = std::numeric_limits<double>::max();
-                    
-                    for (size_t i = 0; i < remaining.size(); ++i) {
-                        double d = get_dist(cur_x, cur_y, remaining[i][0], remaining[i][1]);
-                        if (d < min_dist) {
-                            min_dist = d;
-                            best_idx = i;
-                        }
-                    }
-                    sorted_coords.push_back(remaining[best_idx]);
-                    cur_x = remaining[best_idx][0];
-                    cur_y = remaining[best_idx][1];
-                    remaining.erase(remaining.begin() + best_idx);
+            // Nearest-Neighbor TSP heuristic for path ordering
+            std::vector<std::vector<float>> remaining = boxes.coords;
+            double cx = home_x, cy = home_y;
+            while (!remaining.empty()) {
+                int best = 0;
+                double min_d = std::numeric_limits<double>::max();
+                for (size_t i = 0; i < remaining.size(); ++i) {
+                    double d = get_dist(cx, cy, remaining[i][0], remaining[i][1]);
+                    if (d < min_d) { min_d = d; best = static_cast<int>(i); }
                 }
-                
-                RCLCPP_INFO(node->get_logger(), "Path optimized. Moving to pick up object.");
-                currentState = PICKUP_OBJECT;
-                break;
+                sorted_coords.push_back(remaining[best]);
+                cx = remaining[best][0];
+                cy = remaining[best][1];
+                remaining.erase(remaining.begin() + best);
             }
+            scene_results.assign(sorted_coords.size(), "not_visited");
 
-            case PICKUP_OBJECT: {
-                // Detect using Wrist Camera; 'true' saves the annotated image for marks
-                manipulable_obj_name = yolo.getObjectName(CameraSource::WRIST);
-                
-                if (!manipulable_obj_name.empty()) {
-                    RCLCPP_INFO(node->get_logger(), "Target identified: %s. Executing arm pick...", manipulable_obj_name.c_str());
-                    
-                    // Physical arm movements (Replace these placeholder XYZ with your tested values)
-                    arm.moveGripper(1.0); // Open
-                    arm.moveToCartesianPose(0.18, 0.0, 0.05, 0.0, 1.57, 0.0); // Reach
-                    arm.moveGripper(0.0); // Close
-                    arm.moveToCartesianPose(0.15, 0.0, 0.25, 0.0, 1.57, 0.0); // Lift
-                    
-                    currentState = NAVIGATE_AND_DETECT;
+            RCLCPP_INFO(node->get_logger(), "INIT: Path optimised. Proceeding to PICKUP.");
+            state = PICKUP_OBJECT;
+            break;
+        }
+
+        // ═══════════════════════════════════════════════════════════════════════
+        case PICKUP_OBJECT: {
+            RCLCPP_INFO(node->get_logger(),
+                        "PICKUP: Detecting manipulable object with wrist camera (try %d/5)...",
+                        pickup_tries + 1);
+
+            auto det = yoloRetry(yolo, CameraSource::WRIST, /*save_image=*/true, 3, node);
+            manip_name = det.first;
+            manip_conf = det.second;
+
+            if (!manip_name.empty()) {
+                RCLCPP_INFO(node->get_logger(),
+                            "PICKUP: Detected '%s' (conf=%.2f). Executing pick sequence...",
+                            manip_name.c_str(), manip_conf);
+
+                // ── Arm pick sequence ─────────────────────────────────────────
+                // NOTE: Cartesian coordinates are in arm_mount frame.
+                //   x = forward (away from robot body)
+                //   y = lateral
+                //   z = up
+                //   RPY (0, 1.57, 0) = gripper pointing straight down
+
+                arm.openGripper();
+                std::this_thread::sleep_for(std::chrono::milliseconds(300));
+
+                // Pre-grasp: above the object on the top plate
+                arm.moveToCartesianPose(0.20, 0.0, 0.12, 0.0, 1.57, 0.0);
+
+                // Lower to object grasp height
+                arm.moveToCartesianPose(0.20, 0.0, 0.04, 0.0, 1.57, 0.0);
+
+                // Close gripper to grasp
+                arm.closeGripper();
+                std::this_thread::sleep_for(std::chrono::milliseconds(500));
+
+                // Lift to safe carry height
+                arm.moveToCartesianPose(0.15, 0.0, 0.25, 0.0, 1.57, 0.0);
+
+                RCLCPP_INFO(node->get_logger(), "PICKUP: Complete. Navigating to scene objects.");
+                state = NAVIGATE_AND_DETECT;
+
+            } else {
+                pickup_tries++;
+                if (pickup_tries >= 5) {
+                    RCLCPP_ERROR(node->get_logger(),
+                                 "PICKUP: No object detected after 5 attempts. "
+                                 "Skipping pickup — will still navigate for scene scoring.");
+                    manip_name = "";
+                    manip_conf = 0.0f;
+                    state = NAVIGATE_AND_DETECT;
                 } else {
-                    RCLCPP_WARN(node->get_logger(), "Manipulable object not found on plate. Retrying...");
-                    rclcpp::sleep_for(std::chrono::seconds(1));
+                    RCLCPP_WARN(node->get_logger(), "PICKUP: No detection. Retrying in 1 s...");
+                    std::this_thread::sleep_for(std::chrono::seconds(1));
                 }
+            }
+            break;
+        }
+
+        // ═══════════════════════════════════════════════════════════════════════
+        case NAVIGATE_AND_DETECT: {
+            if (box_idx >= sorted_coords.size()) {
+                RCLCPP_INFO(node->get_logger(),
+                            "NAVIGATE: All %zu locations visited.", sorted_coords.size());
+                state = RETURN_HOME;
                 break;
             }
 
-            case NAVIGATE_AND_DETECT: {
-                if (current_box_index < sorted_coords.size()) {
-                    double tx = sorted_coords[current_box_index][0];
-                    double ty = sorted_coords[current_box_index][1];
-                    double tp = sorted_coords[current_box_index][2];
+            // Bail out early if time is nearly up
+            if (timeLeft < 40) {
+                RCLCPP_WARN(node->get_logger(),
+                            "NAVIGATE: Only %lus left — returning home early.", timeLeft);
+                state = RETURN_HOME;
+                break;
+            }
 
-                    RCLCPP_INFO(node->get_logger(), "Navigating to Location %zu...", current_box_index + 1);
-                    if(nav.moveToGoal(tx, ty, tp)) {
-                        // Scan with OAK-D
-                        std::string scene_obj = yolo.getObjectName(CameraSource::OAKD);
-                        if (scene_obj.empty()) scene_obj = "nothing";
+            double gx = sorted_coords[box_idx][0];
+            double gy = sorted_coords[box_idx][1];
+            double gp = sorted_coords[box_idx][2];
+            RCLCPP_INFO(node->get_logger(),
+                        "NAVIGATE: → Location %zu/%zu  (%.2f, %.2f, %.2f)...",
+                        box_idx + 1, sorted_coords.size(), gx, gy, gp);
 
-                        results_log.push_back("Box at (" + std::to_string(tx) + ", " + std::to_string(ty) + "): " + scene_obj);
+            bool arrived = nav.moveToGoal(gx, gy, gp);
 
-                        // If match found and object is still in hand
-                        if (scene_obj == manipulable_obj_name && !object_placed) {
-                            currentState = PLACE_OBJECT;
-                        } else {
-                            current_box_index++;
-                        }
-                    }
+            // Let sensor data settle after arrival
+            for (int i = 0; i < 10; ++i) {
+                rclcpp::spin_some(node);
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            }
+
+            if (arrived) {
+                RCLCPP_INFO(node->get_logger(),
+                            "NAVIGATE: Arrived at location %zu. Running OAK-D YOLO...",
+                            box_idx + 1);
+
+                // Detect scene object with OAK-D (3 attempts, no image save)
+                auto det = yoloRetry(yolo, CameraSource::OAKD, /*save_image=*/false, 3, node);
+                std::string scene_name = det.first.empty() ? "nothing" : det.first;
+                float scene_conf = det.second;
+
+                scene_results[box_idx] = scene_name;
+                RCLCPP_INFO(node->get_logger(),
+                            "NAVIGATE: Location %zu → '%s' (conf=%.2f)",
+                            box_idx + 1, scene_name.c_str(), scene_conf);
+
+                // Check if this scene object matches the manipulable object
+                if (!placed &&
+                    !manip_name.empty() &&
+                    scene_name == manip_name) {
+                    RCLCPP_INFO(node->get_logger(),
+                                "NAVIGATE: ★ MATCH! '%s' matches manipulable object. "
+                                "Moving to PLACE_OBJECT.",
+                                scene_name.c_str());
+                    state = PLACE_OBJECT;
                 } else {
-                    currentState = RETURN_HOME;
+                    box_idx++;
                 }
-                break;
+            } else {
+                RCLCPP_WARN(node->get_logger(),
+                            "NAVIGATE: Could not reach location %zu.", box_idx + 1);
+                scene_results[box_idx] = "unreachable";
+                box_idx++;
+            }
+            break;
+        }
+
+        // ═══════════════════════════════════════════════════════════════════════
+        case PLACE_OBJECT: {
+            RCLCPP_INFO(node->get_logger(),
+                        "PLACE: Looking for garbage bin AprilTag (IDs 0-4)...");
+
+            // Allow TF frames to update
+            for (int i = 0; i < 15; ++i) {
+                rclcpp::spin_some(node);
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
             }
 
-            case PLACE_OBJECT: {
-                RCLCPP_INFO(node->get_logger(), "Match found. Locating bin...");
-                std::vector<int> visible = tags.getVisibleTags({0,1,2,3,4,5}, 1000);
-                
-                if (!visible.empty()) {
-                    // Placeholder placement sequence
-                    arm.moveToCartesianPose(0.20, 0.0, 0.10, 0.0, 0.0, 0.0); 
-                    arm.moveGripper(1.0); // Release
-                    arm.moveToCartesianPose(0.10, 0.0, 0.25, 0.0, 1.57, 0.0); // Retract
-                    
-                    object_placed = true;
-                    current_box_index++;
-                    currentState = NAVIGATE_AND_DETECT;
-                } else {
-                    RCLCPP_WARN(node->get_logger(), "Bin tag not seen. Adjusting position...");
-                    // Optional: Small rotation if tag is missed
-                    current_box_index++; // For now, skip to avoid getting stuck
-                    currentState = NAVIGATE_AND_DETECT;
+            std::vector<int> visible = tags.getVisibleTags({0, 1, 2, 3, 4}, 500);
+
+            // Determine placement target in arm_mount frame
+            double place_x = 0.25;   // default: straight forward
+            double place_y = 0.0;
+            double place_z = 0.18;   // above bin opening
+
+            if (!visible.empty()) {
+                int bin_tag = visible[0];
+                RCLCPP_INFO(node->get_logger(), "PLACE: Tag %d visible.", bin_tag);
+
+                auto pose_opt = tags.getTagPose(bin_tag, 500);
+                if (pose_opt.has_value()) {
+                    // Tag is mounted on the side of the bin.
+                    // Bin opening is approximately 0.15 m above the tag face.
+                    // Clamp to the arm's reachable workspace.
+                    place_x = std::min(std::max(pose_opt->position.x, 0.12), 0.30);
+                    place_y = std::min(std::max(pose_opt->position.y, -0.15), 0.15);
+                    place_z = pose_opt->position.z + 0.15;
+                    RCLCPP_INFO(node->get_logger(),
+                                "PLACE: Tag pose (%.2f, %.2f, %.2f) → "
+                                "arm target (%.2f, %.2f, %.2f)",
+                                pose_opt->position.x, pose_opt->position.y, pose_opt->position.z,
+                                place_x, place_y, place_z);
                 }
-                break;
+            } else {
+                RCLCPP_WARN(node->get_logger(),
+                            "PLACE: No tag visible — using default placement position.");
             }
 
-            case RETURN_HOME: {
-                RCLCPP_INFO(node->get_logger(), "Mission successful. Returning to start.");
-                nav.moveToGoal(home_x, home_y, home_phi);
+            // Move arm to above the bin
+            arm.moveToCartesianPose(place_x, place_y, place_z, 0.0, 1.57, 0.0);
 
-                // FINAL REQUIREMENT: Output results to text file
-                std::ofstream outfile("contest2_report.txt");
-                outfile << "=== MIE443 Contest 2 Results ===\n";
-                outfile << "Manipulable Object: " << manipulable_obj_name << "\n\n";
-                outfile << "Detected Scene Objects:\n";
-                for (const auto& line : results_log) outfile << "- " << line << "\n";
-                outfile.close();
+            // Release object into bin
+            arm.openGripper();
+            std::this_thread::sleep_for(std::chrono::milliseconds(500));
 
-                currentState = FINISHED;
-                break;
-            }
+            // Retract arm to safe carry position
+            arm.moveToCartesianPose(0.15, 0.0, 0.25, 0.0, 1.57, 0.0);
 
-            case FINISHED:
-                RCLCPP_INFO_ONCE(node->get_logger(), "Contest tasks complete. Standing by.");
-                break;
+            placed = true;
+            RCLCPP_INFO(node->get_logger(), "PLACE: Object released into bin!");
+
+            // Continue visiting remaining scene objects (for scene-identification marks)
+            box_idx++;
+            state = NAVIGATE_AND_DETECT;
+            break;
+        }
+
+        // ═══════════════════════════════════════════════════════════════════════
+        case RETURN_HOME: {
+            RCLCPP_INFO(node->get_logger(),
+                        "RETURN: Navigating home (%.2f, %.2f, %.2f)...",
+                        home_x, home_y, home_phi);
+            nav.moveToGoal(home_x, home_y, home_phi);
+            RCLCPP_INFO(node->get_logger(), "RETURN: Home reached.");
+
+            writeResults(manip_name, manip_conf, sorted_coords, scene_results, placed, false);
+            RCLCPP_INFO(node->get_logger(),
+                        "RETURN: Results written to /home/turtlebot/contest2_report.txt");
+            RCLCPP_INFO(node->get_logger(),
+                        "RETURN: Annotated wrist image saved to /home/turtlebot/detected_object.jpg");
+            state = FINISHED;
+            break;
+        }
+
+        // ═══════════════════════════════════════════════════════════════════════
+        case FINISHED:
+            RCLCPP_INFO_ONCE(node->get_logger(),
+                             "FINISHED: All tasks complete. Standing by.");
+            break;
         }
 
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+
+    // ── Timeout: write whatever data we have ──────────────────────────────────
+    if (state != FINISHED) {
+        RCLCPP_WARN(node->get_logger(), "TIME LIMIT reached — writing partial results.");
+        writeResults(manip_name, manip_conf, sorted_coords, scene_results, placed, true);
     }
 
     rclcpp::shutdown();
