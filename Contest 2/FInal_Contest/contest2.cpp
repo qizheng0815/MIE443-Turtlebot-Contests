@@ -56,7 +56,8 @@ void backUp(std::shared_ptr<rclcpp::Node> node, double speed = 0.12, double back
 //   1. Try direct navigation (30s timeout)
 //   2. Clear costmaps → retry
 //   3. Back up 2s → retry
-//   4. Reduce robot radius to 0.12m → retry → restore radius
+//   4. Keep robot_radius, reduce inflation to 0.05m → retry → restore inflation
+//   5. Reduce robot radius to 0.12m → retry → restore radius
 // Returns true if any attempt succeeded.
 bool navigateWithRecovery(Navigation& nav, std::shared_ptr<rclcpp::Node> node,
                           double x, double y, double phi) {
@@ -74,12 +75,39 @@ bool navigateWithRecovery(Navigation& nav, std::shared_ptr<rclcpp::Node> node,
     backUp(node);
     clearCostmaps(node);
     if (nav.moveToGoalWithTimeout(x, y, phi, 30)) return true;
-    RCLCPP_WARN(node->get_logger(), "Nav failed after backup — reducing robot radius and retrying...");
+    RCLCPP_WARN(node->get_logger(), "Nav failed after backup — reducing inflation radius and retrying...");
 
-    // Attempt 4 — shrink robot radius so planner finds a path, then restore
-    // Originally 0.19m; temporarily reduced to 0.12m to escape tight costmap areas
+    // Attempt 4 — keep robot_radius at 0.19m but drop inflation padding to 0.05m so the
+    // planner can thread narrow gaps while still respecting the robot's physical footprint
     auto param_client_lc = std::make_shared<rclcpp::AsyncParametersClient>(node, "local_costmap");
     auto param_client_gc = std::make_shared<rclcpp::AsyncParametersClient>(node, "global_costmap");
+    for (auto& pc : {param_client_lc, param_client_gc}) {
+        if (pc->wait_for_service(std::chrono::seconds(2))) {
+            auto f = pc->set_parameters({
+                rclcpp::Parameter("inflation_layer.inflation_radius", 0.05)
+            });
+            rclcpp::spin_until_future_complete(node, f, std::chrono::seconds(3));
+        }
+    }
+    RCLCPP_INFO(node->get_logger(), "Inflation radius temporarily reduced to 0.05 m");
+    clearCostmaps(node);
+    bool reached_inflation = nav.moveToGoalWithTimeout(x, y, phi, 30);
+
+    // Always restore inflation before proceeding — attempt 5 sets robot_radius to 0.12m
+    // which would violate Nav2's constraint that inflation_radius >= circumscribed_radius
+    for (auto& pc : {param_client_lc, param_client_gc}) {
+        if (pc->wait_for_service(std::chrono::seconds(2))) {
+            auto f = pc->set_parameters({
+                rclcpp::Parameter("inflation_layer.inflation_radius", 0.24)
+            });
+            rclcpp::spin_until_future_complete(node, f, std::chrono::seconds(3));
+        }
+    }
+    RCLCPP_INFO(node->get_logger(), "Inflation radius restored to 0.24 m");
+    if (reached_inflation) return true;
+    RCLCPP_WARN(node->get_logger(), "Nav failed with reduced inflation — shrinking robot radius and retrying...");
+
+    // Attempt 5 — shrink robot radius to 0.12m so planner finds a path, then restore
     for (auto& pc : {param_client_lc, param_client_gc}) {
         if (pc->wait_for_service(std::chrono::seconds(2))) {
             auto f = pc->set_parameters({rclcpp::Parameter("robot_radius", 0.12)});
@@ -90,7 +118,7 @@ bool navigateWithRecovery(Navigation& nav, std::shared_ptr<rclcpp::Node> node,
     clearCostmaps(node);
     bool reached = nav.moveToGoalWithTimeout(x, y, phi, 30);
 
-    // Restore robot radius
+    // Restore robot radius and inflation radius
     for (auto& pc : {param_client_lc, param_client_gc}) {
         if (pc->wait_for_service(std::chrono::seconds(2))) {
             auto f = pc->set_parameters({
@@ -100,7 +128,7 @@ bool navigateWithRecovery(Navigation& nav, std::shared_ptr<rclcpp::Node> node,
             rclcpp::spin_until_future_complete(node, f, std::chrono::seconds(3));
         }
     }
-    RCLCPP_INFO(node->get_logger(), "Robot radius restored to 0.19 m");
+    RCLCPP_INFO(node->get_logger(), "Robot radius and inflation radius restored");
 
     if (!reached) {
         RCLCPP_ERROR(node->get_logger(),
@@ -296,6 +324,17 @@ int main(int argc, char** argv) {
     // Object detected by wrist camera (used to match against bins later)
     std::string detectedObject;
     int objectId = -1;
+    float bestWristConf = -1.0f;  // tracks highest confidence across all wrist detection attempts
+
+    // Open results log file (timestamped so each run creates a new file)
+    auto log_ts = std::chrono::system_clock::now();
+    std::time_t log_t = std::chrono::system_clock::to_time_t(log_ts);
+    char log_ts_buf[32];
+    std::strftime(log_ts_buf, sizeof(log_ts_buf), "%Y%m%d_%H%M%S", std::localtime(&log_t));
+    std::string log_path = std::string("/home/turtlebot/contest2_results_") + log_ts_buf + ".txt";
+    std::ofstream log_file(log_path);
+    RCLCPP_INFO(node->get_logger(), "Logging results to %s", log_path.c_str());
+    log_file << "=== Contest 2 Results (" << log_ts_buf << ") ===\n\n";
 /*
 // Test YOLO detection
     if (yolo.captureAndDetect(CameraSource::WRIST, true)) {
@@ -319,20 +358,25 @@ int main(int argc, char** argv) {
         RCLCPP_ERROR(node->get_logger(), "Arm movement failed - pose4 may be unreachable");
     }
 
-/*  
-// Test YOLO detection
+  
+// Wrist detection attempt 1
     if (yolo.captureAndDetect(CameraSource::WRIST, true)) {
-        detectedObject = yolo.getLatestClassName();
-        objectId = yolo.getClassId();
-        RCLCPP_INFO(node->get_logger(), "YOLO detection successful: %s | ID: %d | confidence: %.2f",
-                    detectedObject.c_str(), objectId, yolo.getConfidence());
+        float conf = yolo.getConfidence();
+        if (conf > bestWristConf) {
+            bestWristConf  = conf;
+            detectedObject = yolo.getLatestClassName();
+            objectId       = yolo.getClassId();
+        }
+        RCLCPP_INFO(node->get_logger(), "Wrist attempt 1: %s | ID: %d | conf: %.2f",
+                    yolo.getLatestClassName().c_str(), yolo.getClassId(), conf);
+        log_file << "[Wrist attempt 1] " << yolo.getLatestClassName()
+                 << " | ID: " << yolo.getClassId()
+                 << " | Confidence: " << conf << "\n";
     } else {
-        detectedObject = "cup";
-        objectId = 41;
-        RCLCPP_WARN(node->get_logger(), "YOLO detection failed -- defaulting to cup (ID: 41)");
+        RCLCPP_WARN(node->get_logger(), "Wrist attempt 1: no detection");
+        log_file << "[Wrist attempt 1] No detection\n";
     }
-
-*/
+    log_file.flush();
 
     // TEST arm movement with pose 1
     success = armController.moveToCartesianPose(0.114, 0.009, 0.193,
@@ -371,19 +415,39 @@ int main(int argc, char** argv) {
     }
 
 */
-    // Test YOLO detection
+    // Wrist detection attempt 2
     if (yolo.captureAndDetect(CameraSource::WRIST, true)) {
-        detectedObject = yolo.getLatestClassName();
-        objectId = yolo.getClassId();
-        RCLCPP_INFO(node->get_logger(), "YOLO detection successful: %s | ID: %d | confidence: %.2f",
-                    detectedObject.c_str(), objectId, yolo.getConfidence());
+        float conf = yolo.getConfidence();
+        if (conf > bestWristConf) {
+            bestWristConf  = conf;
+            detectedObject = yolo.getLatestClassName();
+            objectId       = yolo.getClassId();
+        }
+        RCLCPP_INFO(node->get_logger(), "Wrist attempt 2: %s | ID: %d | conf: %.2f",
+                    yolo.getLatestClassName().c_str(), yolo.getClassId(), conf);
+        log_file << "[Wrist attempt 2] " << yolo.getLatestClassName()
+                 << " | ID: " << yolo.getClassId()
+                 << " | Confidence: " << conf << "\n";
     } else {
-        detectedObject = "cup";
-        objectId = 41;
-        RCLCPP_WARN(node->get_logger(), "YOLO detection failed -- defaulting to cup (ID: 41)");
+        RCLCPP_WARN(node->get_logger(), "Wrist attempt 2: no detection");
+        log_file << "[Wrist attempt 2] No detection\n";
     }
 
-   
+    // If neither attempt detected anything, default to cup
+    if (bestWristConf < 0.0f) {
+        detectedObject = "cup";
+        objectId = 41;
+        RCLCPP_WARN(node->get_logger(), "All wrist attempts failed — defaulting to cup (ID: 41)");
+        log_file << "[Wrist Camera] All attempts failed — defaulting to: cup (ID: 41)\n";
+    } else {
+        RCLCPP_INFO(node->get_logger(), "Best wrist detection: %s (ID: %d, conf: %.2f)",
+                    detectedObject.c_str(), objectId, bestWristConf);
+        log_file << "[Wrist Camera] Best detection: " << detectedObject
+                 << " | ID: " << objectId << " | Confidence: " << bestWristConf << "\n";
+    }
+    log_file << "\n";
+    log_file.flush();
+
 /*
     // Test arm movement with pose 2
     success = armController.moveToCartesianPose(0.113, 0.008, 0.161,
@@ -453,10 +517,21 @@ int main(int argc, char** argv) {
 
         /***YOUR CODE HERE***/
 
-        // --- Wait briefly for AMCL to publish an initial pose ---
-        for (int w = 0; w < 50 && rclcpp::ok(); ++w) {
-            rclcpp::spin_some(node);
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        // --- Wait until AMCL publishes at least one real pose (10s timeout) ---
+        RCLCPP_INFO(node->get_logger(), "Waiting for AMCL pose (set 2D Pose Estimate in RViz)...");
+        {
+            auto amcl_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+            while (rclcpp::ok() && !robotPose.received &&
+                   std::chrono::steady_clock::now() < amcl_deadline) {
+                rclcpp::spin_some(node);
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            }
+        }
+        if (robotPose.received) {
+            RCLCPP_INFO(node->get_logger(), "AMCL pose received.");
+        } else {
+            RCLCPP_WARN(node->get_logger(),
+                        "AMCL pose timed out — assuming home position (0, 0, 0)");
         }
 
         // --- Store home position ---
@@ -529,10 +604,10 @@ int main(int argc, char** argv) {
         for (int i = 0; i < NUM_WP && rclcpp::ok(); ++i) {
             bool isLastBin = (i == NUM_WP - 1);
 
-            // Compute standoff position: 0.5m back from the bin along phi
+            // Compute standoff position: 0.4m back from the bin along phi
             // wp[i][0..1] is the approximate bin position; wp[i][2] is the heading toward the bin
-            double goal_x   = wp[i][0] - 0.5 * std::cos(wp[i][2]);
-            double goal_y   = wp[i][1] - 0.5 * std::sin(wp[i][2]);
+            double goal_x   = wp[i][0] - 0.4 * std::cos(wp[i][2]);
+            double goal_y   = wp[i][1] - 0.4 * std::sin(wp[i][2]);
             double goal_phi = wp[i][2];
 
             RCLCPP_INFO(node->get_logger(),
@@ -608,7 +683,53 @@ int main(int argc, char** argv) {
             const double HFOV_RAD = 69.0 * M_PI / 180.0;
             const int MAX_CENTER_ATTEMPTS = 3;
 
-            RCLCPP_INFO(node->get_logger(), "Bin %d: running OAK-D YOLO detection...", i + 1);
+            // --- Fan scan: if object is outside the frame, sweep outward in 10° steps
+            // up to ±30° (alternating left/right) until a detection is found.
+            // This updates goal_phi so the centering loop below starts from the found heading.
+            RCLCPP_INFO(node->get_logger(), "Bin %d: initial YOLO detection...", i + 1);
+            if (!yolo.captureAndDetect(CameraSource::OAKD, false)) {
+                RCLCPP_WARN(node->get_logger(),
+                            "Bin %d: no detection at standoff heading — starting fan scan", i + 1);
+                const double SCAN_STEP_RAD  = 10.0 * M_PI / 180.0;
+                const int    SCAN_STEPS     = 3;   // ±10°, ±20°, ±30°
+                bool scan_found = false;
+                rclcpp::spin_some(node);
+                double base_phi = robotPose.phi;
+
+                for (int step = 1; step <= SCAN_STEPS && !scan_found; ++step) {
+                    // Try left (+step), then right (-step)
+                    for (int dir : {1, -1}) {
+                        double scan_phi = base_phi + dir * step * SCAN_STEP_RAD;
+                        RCLCPP_INFO(node->get_logger(),
+                                    "Bin %d: fan scan step %d dir %+d — rotating to %.1f deg",
+                                    i + 1, step, dir, scan_phi * 180.0 / M_PI);
+                        setNavTolerances(node, 1.0, 2.0 * M_PI / 180.0);  // loose xy, tight yaw
+                        nav.moveToGoalWithTimeout(robotPose.x, robotPose.y, scan_phi, 10);
+                        setNavTolerances(node, 0.50, 6.0 * M_PI / 180.0);  // restore
+
+                        if (yolo.captureAndDetect(CameraSource::OAKD, false)) {
+                            RCLCPP_INFO(node->get_logger(),
+                                        "Bin %d: fan scan found %s at step %d dir %+d",
+                                        i + 1, yolo.getLatestClassName().c_str(), step, dir);
+                            rclcpp::spin_some(node);
+                            goal_phi = robotPose.phi;  // update heading for centering loop
+                            scan_found = true;
+                            break;
+                        }
+                    }
+                }
+
+                if (!scan_found) {
+                    // Rotate back to original standoff heading before moving on
+                    setNavTolerances(node, 1.0, 2.0 * M_PI / 180.0);
+                    nav.moveToGoalWithTimeout(robotPose.x, robotPose.y, base_phi, 10);
+                    setNavTolerances(node, 0.50, 6.0 * M_PI / 180.0);
+                    RCLCPP_WARN(node->get_logger(),
+                                "Bin %d: fan scan exhausted — no object found", i + 1);
+                }
+            }
+
+            RCLCPP_INFO(node->get_logger(), "Bin %d: running OAK-D YOLO centering...", i + 1);
             for (int attempt = 0; attempt < MAX_CENTER_ATTEMPTS; ++attempt) {
                 if (!yolo.captureAndDetect(CameraSource::OAKD, (attempt == MAX_CENTER_ATTEMPTS - 1))) {
                     RCLCPP_WARN(node->get_logger(),
@@ -622,6 +743,11 @@ int main(int argc, char** argv) {
                 RCLCPP_INFO(node->get_logger(),
                             "Bin %d attempt %d: %s (conf: %.2f, offset: %.2f)",
                             i + 1, attempt + 1, binObject[i].c_str(), yolo.getConfidence(), offset);
+                log_file << "[Bin " << (i + 1) << " attempt " << (attempt + 1) << "] "
+                         << binObject[i] << " | ID: " << binObjectId[i]
+                         << " | Confidence: " << yolo.getConfidence()
+                         << " | Offset: " << offset << "\n";
+                log_file.flush();
 
                 // If centred enough, relocalize AMCL using the known bin position and stop adjusting
                 if (std::abs(offset) <= CENTER_THRESHOLD) {
@@ -689,10 +815,20 @@ int main(int argc, char** argv) {
         }
 
         // --- Summary of all bin detections ---
+        log_file << "\n=== Final Summary ===\n";
+        log_file << "Carried object (wrist): " << detectedObject << " (ID: " << objectId << ")\n";
         for (int i = 0; i < NUM_WP; ++i) {
             RCLCPP_INFO(node->get_logger(),
                         "Bin %d: %s (ID: %d)", i + 1, binObject[i].c_str(), binObjectId[i]);
+            std::string bin_str = binObject[i].empty() ? "none" : binObject[i];
+            log_file << "Bin " << (i + 1) << ": " << bin_str
+                     << " (ID: " << binObjectId[i] << ")";
+            if (!binObject[i].empty() && binObject[i] == detectedObject) {
+                log_file << "  <-- MATCH (dropoff here)";
+            }
+            log_file << "\n";
         }
+        log_file.flush();
 
         // --- Return to home ---
         RCLCPP_INFO(node->get_logger(), "All waypoints visited. Returning to home...");
@@ -727,8 +863,8 @@ void dropoff(ArmController& armController, rclcpp::Node::SharedPtr node) {
         RCLCPP_ERROR(node->get_logger(), "Arm movement failed Object detection pose is unreachable");
     }
     // TEST arm movement with dropoff pose 1
-    success = armController.moveToCartesianPose(0.042, -0.216, 0.274,
-                                                -0.201, -0.012, 0.050, 0.978);
+    success = armController.moveToCartesianPose(0.041, -0.323, 0.114,
+                                                -0.176, -0.027, -0.080, 0.981);
     
     if(success) {  
         RCLCPP_INFO(node->get_logger(), "Arm moved successfully!");
