@@ -53,28 +53,54 @@ void backUp(std::shared_ptr<rclcpp::Node> node, double speed = 0.12, double back
 }
 
 // Navigate to goal with a recovery sequence on failure:
-//   1. Try direct navigation (30s timeout)
+//   1. Try direct navigation
 //   2. Clear costmaps → retry
 //   3. Back up 2s → retry
 //   4. Keep robot_radius, reduce inflation to 0.05m → retry → restore inflation
 //   5. Reduce robot radius to 0.12m → retry → restore radius
+// time_budget_sec caps total time across all attempts so a stuck bin
+// cannot prevent remaining bins from being visited.
 // Returns true if any attempt succeeded.
 bool navigateWithRecovery(Navigation& nav, std::shared_ptr<rclcpp::Node> node,
-                          double x, double y, double phi) {
+                          double x, double y, double phi, int time_budget_sec = 105) {
+    auto budget_start = std::chrono::steady_clock::now();
+    auto time_used = [&]() {
+        return (int)std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::steady_clock::now() - budget_start).count();
+    };
+    // Each attempt gets an equal share of the remaining budget (5 attempts total)
+    auto attempt_timeout = [&](int attempt_num) -> int {
+        int remaining = time_budget_sec - time_used();
+        int attempts_left = 6 - attempt_num;  // attempts_left including this one
+        return std::max(5, remaining / attempts_left);
+    };
+
     // Attempt 1 — normal navigation
-    if (nav.moveToGoalWithTimeout(x, y, phi, 30)) return true;
+    if (nav.moveToGoalWithTimeout(x, y, phi, attempt_timeout(1))) return true;
+    if (time_used() >= time_budget_sec) {
+        RCLCPP_WARN(node->get_logger(), "Nav budget exhausted — skipping waypoint");
+        return false;
+    }
     RCLCPP_WARN(node->get_logger(), "Nav failed — clearing costmaps and retrying...");
 
     // Attempt 2 — clear costmaps + retry
     clearCostmaps(node);
     std::this_thread::sleep_for(std::chrono::milliseconds(500));
-    if (nav.moveToGoalWithTimeout(x, y, phi, 30)) return true;
+    if (nav.moveToGoalWithTimeout(x, y, phi, attempt_timeout(2))) return true;
+    if (time_used() >= time_budget_sec) {
+        RCLCPP_WARN(node->get_logger(), "Nav budget exhausted — skipping waypoint");
+        return false;
+    }
     RCLCPP_WARN(node->get_logger(), "Nav failed after costmap clear — backing up and retrying...");
 
     // Attempt 3 — back up + retry
     backUp(node);
     clearCostmaps(node);
-    if (nav.moveToGoalWithTimeout(x, y, phi, 30)) return true;
+    if (nav.moveToGoalWithTimeout(x, y, phi, attempt_timeout(3))) return true;
+    if (time_used() >= time_budget_sec) {
+        RCLCPP_WARN(node->get_logger(), "Nav budget exhausted — skipping waypoint");
+        return false;
+    }
     RCLCPP_WARN(node->get_logger(), "Nav failed after backup — reducing inflation radius and retrying...");
 
     // Attempt 4 — keep robot_radius at 0.19m but drop inflation padding to 0.05m so the
@@ -91,7 +117,7 @@ bool navigateWithRecovery(Navigation& nav, std::shared_ptr<rclcpp::Node> node,
     }
     RCLCPP_INFO(node->get_logger(), "Inflation radius temporarily reduced to 0.05 m");
     clearCostmaps(node);
-    bool reached_inflation = nav.moveToGoalWithTimeout(x, y, phi, 30);
+    bool reached_inflation = nav.moveToGoalWithTimeout(x, y, phi, attempt_timeout(4));
 
     // Always restore inflation before proceeding — attempt 5 sets robot_radius to 0.12m
     // which would violate Nav2's constraint that inflation_radius >= circumscribed_radius
@@ -105,6 +131,10 @@ bool navigateWithRecovery(Navigation& nav, std::shared_ptr<rclcpp::Node> node,
     }
     RCLCPP_INFO(node->get_logger(), "Inflation radius restored to 0.24 m");
     if (reached_inflation) return true;
+    if (time_used() >= time_budget_sec) {
+        RCLCPP_WARN(node->get_logger(), "Nav budget exhausted — skipping waypoint");
+        return false;
+    }
     RCLCPP_WARN(node->get_logger(), "Nav failed with reduced inflation — shrinking robot radius and retrying...");
 
     // Attempt 5 — shrink robot radius to 0.12m so planner finds a path, then restore
@@ -116,7 +146,7 @@ bool navigateWithRecovery(Navigation& nav, std::shared_ptr<rclcpp::Node> node,
     }
     RCLCPP_INFO(node->get_logger(), "Robot radius temporarily reduced to 0.12 m");
     clearCostmaps(node);
-    bool reached = nav.moveToGoalWithTimeout(x, y, phi, 30);
+    bool reached = nav.moveToGoalWithTimeout(x, y, phi, attempt_timeout(5));
 
     // Restore robot radius and inflation radius
     for (auto& pc : {param_client_lc, param_client_gc}) {
@@ -133,6 +163,11 @@ bool navigateWithRecovery(Navigation& nav, std::shared_ptr<rclcpp::Node> node,
     if (!reached) {
         RCLCPP_ERROR(node->get_logger(),
                      "All recovery attempts failed — skipping waypoint (%.2f, %.2f)", x, y);
+        // Clear costmaps after full failure to reset Nav2's state for the next waypoint.
+        // This prevents a corrupted/stale costmap from causing immediate code-6 rejections
+        // on subsequent goals.
+        clearCostmaps(node);
+        std::this_thread::sleep_for(std::chrono::milliseconds(1000));
     }
     return reached;
 }
@@ -218,9 +253,12 @@ int main(int argc, char** argv) {
 
     // Robot pose object + subscriber
     RobotPose robotPose(0, 0, 0);
+    // TRANSIENT_LOCAL matches AMCL's publisher durability — ensures the last published
+    // pose is delivered even if the pose was set before this node subscribed.
+    auto amcl_qos = rclcpp::QoS(10).transient_local();
     auto amclSub = node->create_subscription<geometry_msgs::msg::PoseWithCovarianceStamped>(
         "/amcl_pose",
-        10,
+        amcl_qos,
         std::bind(&RobotPose::poseCallback, &robotPose, std::placeholders::_1)
     );
 
@@ -501,10 +539,64 @@ int main(int argc, char** argv) {
 
 
 
-    // Contest countdown timer
-    auto start = std::chrono::system_clock::now();
     uint64_t secondsElapsed = 0;
 
+    // --- Wait until AMCL publishes at least one real pose (30s timeout) ---
+    // Done BEFORE starting the contest timer so this wait does not eat into the 300s window.
+    // The subscription uses TRANSIENT_LOCAL so it will receive the pose even if
+    // the 2D Pose Estimate was set in RViz before this node started.
+    RCLCPP_INFO(node->get_logger(), "Waiting for AMCL pose (set 2D Pose Estimate in RViz)...");
+    {
+        auto amcl_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+        while (rclcpp::ok() && !robotPose.received &&
+               std::chrono::steady_clock::now() < amcl_deadline) {
+            rclcpp::spin_some(node);
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+    }
+    if (robotPose.received) {
+        RCLCPP_INFO(node->get_logger(), "AMCL pose received — waiting 2s for particle filter to stabilize...");
+        auto stable = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        while (rclcpp::ok() && std::chrono::steady_clock::now() < stable) {
+            rclcpp::spin_some(node);
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+    } else {
+        RCLCPP_WARN(node->get_logger(),
+                    "AMCL pose timed out — navigation will be unreliable without initial pose!");
+        RCLCPP_WARN(node->get_logger(),
+                    "Assuming home (0, 0, 0) — set 2D Pose Estimate in RViz before running!");
+    }
+
+    // --- Initialize navigation ---
+    Navigation nav(node);
+
+    // 50 cm position circle, ±10° yaw cone
+    setNavTolerances(node, 0.50, 6.0 * M_PI / 180.0);
+
+    // Wait for costmap parameter services to be ready before setting robot radius.
+    // Done BEFORE the timer so this overhead doesn't reduce navigation time.
+    {
+        auto client = std::make_shared<rclcpp::AsyncParametersClient>(node, "global_costmap");
+        for (int retry = 0; retry < 10 && !client->wait_for_service(std::chrono::seconds(2)); ++retry) {
+            RCLCPP_WARN(node->get_logger(), "Costmap not ready — retry %d/10", retry + 1);
+            rclcpp::spin_some(node);
+        }
+    }
+    // Increase robot radius to 0.19m (originally 0.17m) so the planner avoids
+    // paths through narrow corridors the robot physically cannot navigate cleanly
+    setRobotRadius(node, 0.19);
+
+    // --- Store home position (after AMCL has settled) ---
+    double homeX   = robotPose.x;
+    double homeY   = robotPose.y;
+    double homePhi = robotPose.phi;
+    RCLCPP_INFO(node->get_logger(),
+                "Home stored: x=%.3f  y=%.3f  phi=%.3f rad", homeX, homeY, homePhi);
+
+    // Contest countdown timer — starts AFTER all initialization so the full 300s
+    // is available for navigation, not consumed by AMCL/costmap startup waits.
+    auto start = std::chrono::system_clock::now();
     RCLCPP_INFO(node->get_logger(), "Starting contest - 300 seconds timer begins now!");
 
     // Execute strategy
@@ -516,41 +608,6 @@ int main(int argc, char** argv) {
         secondsElapsed = std::chrono::duration_cast<std::chrono::seconds>(now - start).count();
 
         /***YOUR CODE HERE***/
-
-        // --- Wait until AMCL publishes at least one real pose (10s timeout) ---
-        RCLCPP_INFO(node->get_logger(), "Waiting for AMCL pose (set 2D Pose Estimate in RViz)...");
-        {
-            auto amcl_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
-            while (rclcpp::ok() && !robotPose.received &&
-                   std::chrono::steady_clock::now() < amcl_deadline) {
-                rclcpp::spin_some(node);
-                std::this_thread::sleep_for(std::chrono::milliseconds(100));
-            }
-        }
-        if (robotPose.received) {
-            RCLCPP_INFO(node->get_logger(), "AMCL pose received.");
-        } else {
-            RCLCPP_WARN(node->get_logger(),
-                        "AMCL pose timed out — assuming home position (0, 0, 0)");
-        }
-
-        // --- Store home position ---
-        double homeX   = robotPose.x;
-        double homeY   = robotPose.y;
-        double homePhi = robotPose.phi;
-        RCLCPP_INFO(node->get_logger(),
-                    "Home stored: x=%.3f  y=%.3f  phi=%.3f rad",
-                    homeX, homeY, homePhi);
-
-        // --- Initialize navigation ---
-        Navigation nav(node);
-
-        // 50 cm position circle, ±10° yaw cone
-        setNavTolerances(node, 0.50, 6.0 * M_PI / 180.0);
-
-        // Increase robot radius to 0.19m (originally 0.17m) so the planner avoids
-        // paths through narrow corridors the robot physically cannot navigate cleanly
-        setRobotRadius(node, 0.19);
 
         // --- Waypoints from coords.xml ---
         const int NUM_WP = 5;
@@ -592,6 +649,8 @@ int main(int argc, char** argv) {
         std::string binObject[NUM_WP];
         int binObjectId[NUM_WP];
         for (int i = 0; i < NUM_WP; ++i) { binObject[i] = ""; binObjectId[i] = -1; }
+        int lastVisitedBin = -1;   // tracks the last bin actually visited (not skipped)
+        bool droppedOff    = false; // true once dropoff() has been called
 
         // Candidate AprilTag IDs to scan for at each bin (AprilTag disabled)
         // std::vector<int> tagCandidates = {0, 1, 2, 3, 4};  // 36H11 family, IDs 0-4
@@ -600,9 +659,36 @@ int main(int argc, char** argv) {
         auto initialpose_pub = node->create_publisher<geometry_msgs::msg::PoseWithCovarianceStamped>(
             "/initialpose", 10);
 
+        // Time constants for budget planning
+        const int CONTEST_DURATION  = 300;  // seconds
+        const int HOME_RESERVE      = 40;   // seconds reserved to return home
+        const int MIN_TIME_PER_BIN  = 15;   // minimum seconds needed to attempt a bin
+
         // --- Sequential path planning ---
         for (int i = 0; i < NUM_WP && rclcpp::ok(); ++i) {
             bool isLastBin = (i == NUM_WP - 1);
+
+            // Refresh elapsed time and check whether there is enough time budget remaining
+            // to visit this bin AND all subsequent bins AND return home.
+            {
+                auto tNow = std::chrono::system_clock::now();
+                secondsElapsed = std::chrono::duration_cast<std::chrono::seconds>(
+                                     tNow - start).count();
+                int time_remaining  = CONTEST_DURATION - (int)secondsElapsed;
+                int bins_remaining  = NUM_WP - i;           // includes current bin
+                int time_needed     = HOME_RESERVE + bins_remaining * MIN_TIME_PER_BIN;
+
+                RCLCPP_INFO(node->get_logger(),
+                            "Bin %d/%d — %ds remaining, need ~%ds for %d bins + home",
+                            i + 1, NUM_WP, time_remaining, time_needed, bins_remaining);
+
+                if (time_remaining < time_needed) {
+                    RCLCPP_WARN(node->get_logger(),
+                                "Skipping bin %d — only %ds left, not enough for %d bins + home reserve",
+                                i + 1, time_remaining, bins_remaining);
+                    continue;
+                }
+            }
 
             // Compute standoff position: 0.4m back from the bin along phi
             // wp[i][0..1] is the approximate bin position; wp[i][2] is the heading toward the bin
@@ -610,12 +696,30 @@ int main(int argc, char** argv) {
             double goal_y   = wp[i][1] - 0.4 * std::sin(wp[i][2]);
             double goal_phi = wp[i][2];
 
-            RCLCPP_INFO(node->get_logger(),
-                        "Step %d/%d — bin %d at (%.3f, %.3f), standoff goal (%.3f, %.3f, %.3f rad)",
-                        i + 1, NUM_WP, i + 1,
-                        wp[i][0], wp[i][1], goal_x, goal_y, goal_phi);
+            // Budget for this bin: fair share of remaining time minus home reserve,
+            // capped at 90s so one bin cannot starve the others.
+            {
+                auto tNow = std::chrono::system_clock::now();
+                secondsElapsed = std::chrono::duration_cast<std::chrono::seconds>(
+                                     tNow - start).count();
+                int time_remaining = CONTEST_DURATION - (int)secondsElapsed;
+                int bins_remaining = NUM_WP - i;
+                int bin_budget = std::min(90, (time_remaining - HOME_RESERVE) / bins_remaining);
 
-            navigateWithRecovery(nav, node, goal_x, goal_y, goal_phi);
+                RCLCPP_INFO(node->get_logger(),
+                            "Step %d/%d — bin %d at (%.3f, %.3f), standoff goal (%.3f, %.3f, %.3f rad) [budget: %ds]",
+                            i + 1, NUM_WP, i + 1,
+                            wp[i][0], wp[i][1], goal_x, goal_y, goal_phi, bin_budget);
+
+                bool nav_reached = navigateWithRecovery(nav, node, goal_x, goal_y, goal_phi, bin_budget);
+                if (!nav_reached) {
+                    RCLCPP_WARN(node->get_logger(),
+                                "Bin %d: navigation failed — skipping detection and relocalization",
+                                i + 1);
+                    continue;  // Do NOT run YOLO or relocalization from the wrong position
+                }
+                lastVisitedBin = i;
+            }
 
             // Wait for camera to stabilize after robot stops moving (avoids motion blur)
             std::this_thread::sleep_for(std::chrono::milliseconds(500));
@@ -790,18 +894,20 @@ int main(int argc, char** argv) {
                 setNavTolerances(node, 0.50, 6.0 * M_PI / 180.0);  // restore
             }
 
-            // If this bin matches the carried object, drop off
+            // If this bin matches the carried object, drop off immediately
             if (!binObject[i].empty() && binObject[i] == detectedObject) {
                 RCLCPP_INFO(node->get_logger(),
                             "Bin %d matches carried object (%s) — executing dropoff!",
                             i + 1, detectedObject.c_str());
                 dropoff(armController, node);
+                droppedOff = true;
             } else if (isLastBin) {
-                // No matching bin found across all bins — drop off at last bin as fallback
+                // Reached bin 5 with no match found — drop off as fallback
                 RCLCPP_WARN(node->get_logger(),
                             "Last bin: no matching bin found for %s — executing dropoff as fallback",
                             detectedObject.c_str());
                 dropoff(armController, node);
+                droppedOff = true;
             }
 
             // Update elapsed time
@@ -812,6 +918,14 @@ int main(int argc, char** argv) {
                 RCLCPP_WARN(node->get_logger(), "Time running low — stopping early");
                 break;
             }
+        }
+
+        // --- Fallback dropoff if loop ended without a match (e.g. last bin was time-skipped) ---
+        if (!droppedOff && lastVisitedBin >= 0) {
+            RCLCPP_WARN(node->get_logger(),
+                        "No matching bin found for %s — dropping off at last visited bin (%d) as fallback",
+                        detectedObject.c_str(), lastVisitedBin + 1);
+            dropoff(armController, node);
         }
 
         // --- Summary of all bin detections ---

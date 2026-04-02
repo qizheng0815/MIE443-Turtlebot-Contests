@@ -6,6 +6,7 @@ RobotPose::RobotPose(double x, double y, double phi) {
 	this->x = x;
 	this->y = y;
 	this->phi = phi;
+	this->received = false;
 }
 
 void RobotPose::poseCallback(const geometry_msgs::msg::PoseWithCovarianceStamped::SharedPtr msg) {
@@ -13,4 +14,5 @@ void RobotPose::poseCallback(const geometry_msgs::msg::PoseWithCovarianceStamped
 	phi = tf2::getYaw(msg->pose.pose.orientation);
 	x = msg->pose.pose.position.x;
 	y = msg->pose.pose.position.y;
+	received = true;
 }
